@@ -9,19 +9,6 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!--
-        protectionLevel="dangerous" — requested at runtime by the main app, not granted at
-        install time. Learned the hard way on the Linux Plugin: a "normal" custom permission is
-        only granted to the requesting app at THAT app's own install/update time, checked
-        against whatever permissions already exist on the device then. Since almost every real
-        user installs the main LobiShell app long before this plugin, a "normal" grant would
-        silently and permanently fail for virtually everyone.
-    -->
-    <permission
-        android:name="de.lobianco.saftssh.remotedesktop.READ_BINARY"
-        android:protectionLevel="dangerous"
-        android:label="Access LobiShell Remote Desktop Plugin" />
-
     <application
         android:label="LobiShell Remote Desktop Plugin"
         android:allowBackup="false"
@@ -37,10 +24,12 @@
             </intent-filter>
         </activity>
 
+        <!-- exported="true" for cross-app binding; no custom Android permission gates it — see
+             RemoteDesktopSessionService.onBind's doc for why (a "dangerous" custom permission's
+             grant dialog renders as a generic "perform an unknown action" on modern Android). -->
         <service
             android:name=".RemoteDesktopSessionService"
             android:exported="true"
-            android:permission="de.lobianco.saftssh.remotedesktop.READ_BINARY"
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"

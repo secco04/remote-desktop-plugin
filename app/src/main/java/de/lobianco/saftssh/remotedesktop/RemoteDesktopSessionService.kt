@@ -2,10 +2,25 @@ package de.lobianco.saftssh.remotedesktop
 
 import android.app.Service
 import android.content.Intent
+import android.os.Binder
 import android.os.IBinder
 import android.util.Log
 
 private const val TAG = "RemoteDesktopSession"
+
+/** Only the main LobiShell app may use this service. NOT enforced via a custom Android
+ *  permission — see the Linux Plugin's identical guard for why a "dangerous" custom permission's
+ *  grant dialog renders as a generic, alarming "perform an unknown action" on modern Android
+ *  regardless of our own android:label. Checking the caller's package identity directly avoids
+ *  that dialog while still blocking unrelated apps.
+ *
+ *  IMPORTANT: this check must live in the AIDL Stub's method bodies (createSession below), NOT in
+ *  Service.onBind() — onBind() is a local lifecycle callback dispatched by this process's own
+ *  ActivityThread, not a live incoming Binder transaction, so Binder.getCallingUid() there just
+ *  returns THIS process's own uid (confirmed on-device: it resolved to this plugin's own package,
+ *  never the caller's — silently rejecting every real client). AIDL Stub methods, in contrast,
+ *  genuinely execute inside the calling transaction, where getCallingUid() is meaningful. */
+private val ALLOWED_CALLER_PACKAGES = setOf("de.lobianco.saftssh")
 
 /**
  * Bound AIDL service exposing [IRemoteDesktopSessionService]. Each session drives a headless
@@ -27,6 +42,18 @@ class RemoteDesktopSessionService : Service() {
     private val openSessions = java.util.concurrent.CopyOnWriteArrayList<SessionImpl>()
 
     override fun onBind(intent: Intent?): IBinder = serviceStub.asBinder()
+
+    /** True if the app on the other end of the CURRENT incoming Binder transaction is an
+     *  authorized caller. Must only be called from inside an AIDL Stub method body. */
+    private fun isCallerAuthorized(): Boolean {
+        val callingUid = Binder.getCallingUid()
+        val callerPackages = packageManager.getPackagesForUid(callingUid) ?: arrayOf()
+        val authorized = callerPackages.any { it in ALLOWED_CALLER_PACKAGES }
+        if (!authorized) {
+            Log.w(TAG, "Rejected call from unauthorized caller uid=$callingUid packages=${callerPackages.joinToString()}")
+        }
+        return authorized
+    }
 
     override fun onDestroy() {
         openSessions.forEach { runCatching { it.destroyInternal() } }
@@ -52,6 +79,7 @@ class RemoteDesktopSessionService : Service() {
             surface: android.view.Surface?, width: Int, height: Int,
             callback: IRemoteDesktopSessionCallback?,
         ): IRemoteDesktopSession? {
+            if (!isCallerAuthorized()) return null
             return try {
                 requireNotNull(protocol) { "protocol is required (\"vnc\" | \"rdp\" | \"spice\")" }
                 requireNotNull(host) { "host is required" }
