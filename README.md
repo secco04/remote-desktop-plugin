@@ -7,29 +7,41 @@ Studio project. It is NOT a module of the main LobiShell app.
 
 ## What this is
 
-A combined remote-desktop plugin for LobiShell's future `REMOTE_DESKTOP` connection type,
-covering VNC, RDP, and SPICE from a single AIDL bound service (protocol selected per
-connection) — mirroring how the vendored client library itself is organized.
+A remote-desktop plugin for LobiShell's `REMOTE_DESKTOP` connection type, exposed via a single
+AIDL bound service (protocol selected per connection).
 
 **applicationId:** `de.lobianco.saftssh.remotedesktop`
 
+**Protocol support:**
+- **VNC** — implemented (`vnc/VncClient.kt`), from scratch, not derived from bVNC's source.
+- **RDP / SPICE** — not implemented. Both need a native runtime (FreeRDP / spice-gtk) requiring a
+  real NDK cross-compile toolchain, which can't be set up or verified without hands-on Android
+  Studio work. `RemoteDesktopSessionService.buildSession()` fails these with a clear error rather
+  than a broken half-implementation.
+
 ---
 
-## Vendored client library
+## Why VNC is a from-scratch client, not the vendored library
 
-`remote-desktop-clients/` is a **git submodule** pointing at
-https://github.com/secco04/remote-desktop-clients, a fork of Iordan Iordanov's
-[remote-desktop-clients](https://github.com/iiordanov/bVNC) (bVNC/aRDP/aSPICE/Opaque) —
-established, actively-maintained, GPL-3.0 VNC/RDP/SPICE Android clients, plus Proxmox/oVirt VM
-discovery. See [LICENSE](LICENSE) for the full license breakdown.
+`remote-desktop-clients/` is still vendored here as a git submodule
+(https://github.com/secco04/remote-desktop-clients, a fork of
+[iiordanov/bVNC](https://github.com/iiordanov/bVNC)) — kept for reference and as the eventual
+base for RDP/SPICE, since FreeRDP/spice-gtk's native build scripts live there. See
+[LICENSE](LICENSE) for its license breakdown, and its own `COPYRIGHT-bVNC`/`LICENSE` files.
 
-The submodule is **unmodified** — no patches applied directly to the vendored source. All
-LobiShell-specific integration (AIDL service, permission model, connection-metadata plumbing)
-lives in this repo's own `app/` module and calls into the vendored library's classes.
+Its VNC classes turned out to be unusable as a plain library, though: `RemoteCanvas` (the
+framebuffer view) implements a 30-method `Viewable` interface covering pan/zoom/toolbar/toast
+concerns, and is driven by `RemoteCanvasHandler` — a 700+-line Activity-oriented state machine.
+The whole thing is built as a complete interactive Activity, not a headless engine, so adapting it
+into a bound service with no window would have meant writing a large amount of glue code with no
+way to compile-check it here. RFB (VNC's wire protocol, RFC 6143) is small and well-specified, so
+implementing just what a "connect, decode framebuffer updates, draw them, send input" client needs
+was the more honest path to something that actually works. See `vnc/VncClient.kt`'s class doc for
+exactly what it does and doesn't support.
 
-**Getting upstream updates:** on GitHub, open
-https://github.com/secco04/remote-desktop-clients and click **"Sync fork"** — no local git
-commands needed. Afterwards, bump the submodule pointer here:
+**Getting upstream updates to the submodule** (for future RDP/SPICE work): on GitHub, open
+https://github.com/secco04/remote-desktop-clients and click **"Sync fork"**, then bump the
+submodule pointer here:
 ```
 cd remote-desktop-clients
 git pull origin master
@@ -43,50 +55,30 @@ git commit -m "Sync remote-desktop-clients submodule"
 ## Building
 
 Open this directory as its own Android Studio project (File → Open → select
-`remote-desktop-plugin/`). Clone with `--recurse-submodules`, or run
-`git submodule update --init` after a plain clone — the `remote-desktop-clients/` submodule
-won't be populated otherwise.
+`remote-desktop-plugin/`). The plugin APK must be installed on the device alongside the main
+LobiShell app. The main app binds the service using the action
+`de.lobianco.saftssh.remotedesktop.BIND_SESSION_SERVICE`.
 
-The plugin APK must be installed on the device alongside the main LobiShell app. The main app
-binds the service using the action `de.lobianco.saftssh.remotedesktop.BIND_SESSION_SERVICE`.
+## Bind authorization
 
----
-
-## Permission model
-
-Same pattern as the LobiShell Linux Plugin: a custom permission
-(`de.lobianco.saftssh.remotedesktop.READ_BINARY`), `protectionLevel="dangerous"` — requested at
-runtime by the main app, not install-time — since a "normal" permission would silently never get
-granted for anyone who installs the main app before this plugin (see the Linux Plugin's own
-history for why).
+No custom Android permission — a `dangerous`-protectionLevel custom permission's grant dialog
+renders as a generic, alarming "perform an unknown action" on modern Android regardless of its
+`android:label` (confirmed against AOSP's PermissionController source; same finding applies to
+the Linux Plugin). `RemoteDesktopSessionService`'s AIDL methods instead check the calling
+package's identity directly (`Binder.getCallingUid()` inside the AIDL method body — NOT in
+`onBind()`, which doesn't run inside a live incoming transaction and would just see this
+process's own uid).
 
 ## Status
 
-- `app/` module skeleton: `build.gradle.kts`, `AndroidManifest.xml` (dangerous permission +
-  bound service declaration), launcher `InfoActivity`. Builds standalone.
-- AIDL contract designed and written (both here and mirrored in the main app repo):
-  `IRemoteDesktopSessionService.createSession(protocol, host, port, user, pass, surface, w, h,
-  callback)` → `IRemoteDesktopSession` (resize/sendPointerEvent/sendKeyEvent/destroy). The
-  `android.view.Surface` is drawn onto directly by the plugin process — no per-frame pixel data
-  crosses the Binder call.
-- `RemoteDesktopSessionService.kt` — service/session scaffolding in place, but
-  **`buildSession()` throws `UnsupportedOperationException`** — the actual vendored-library
-  integration isn't wired yet. See the TODOs in that file for the concrete plan (host a
-  `RemoteCanvas` offscreen, blit its `Bitmap` onto the `Surface` on every `reDraw()`, dispatch
-  pointer/key events into its existing input handling).
-
-### Wiring the vendored library — needs Android Studio
-
-`remote-desktop-clients/bVNC` and `remote-desktop-clients/remoteClientLib` are proper
-`com.android.library` modules, but on **Groovy DSL + AGP 8.13.2**, while this project's own
-`app/` module is **Kotlin DSL + AGP 9.2.1**. This mismatch needs to be resolved with a real
-Gradle sync (not verifiable without one — same constraint as the Linux Plugin's native builds).
-Two approaches to try, in `settings.gradle.kts`:
-
-1. `includeBuild("remote-desktop-clients")` (composite build) + `dependencySubstitution` rules.
-2. `include(":bvnc-lib")` + `project(":bvnc-lib").projectDir = file("remote-desktop-clients/bVNC")`
-   (and the same for `remoteClientLib`) — simpler, but check whether the modules' own AGP-8-era
-   config survives being built under AGP 9 unmodified.
-
-Once resolved, `app/build.gradle.kts`'s `dependencies {}` block has the exact `implementation(...)`
-lines to uncomment.
+- `app/` module: manifest, bound service, `InfoActivity`. Builds standalone.
+- AIDL contract: `IRemoteDesktopSessionService.createSession(protocol, host, port, user, pass,
+  surface, w, h, callback)` → `IRemoteDesktopSession` (resize/sendPointerEvent/sendKeyEvent/
+  destroy). The `android.view.Surface` is drawn onto directly by the plugin process — no
+  per-frame pixel data crosses the Binder call.
+- **VNC**: connects, authenticates (None or VNC-Auth/DES), renders Raw+CopyRect-encoded updates
+  onto the Surface, forwards pointer and keyboard input. Not yet verified on a real device/server
+  (no way to run a build here) — expect the first real test pass to surface bugs, same as every
+  other piece of this app.
+- **RDP/SPICE**: `buildSession()` throws a clear `UnsupportedOperationException` naming the
+  reason (no native runtime bundled) rather than attempting anything.

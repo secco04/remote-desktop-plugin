@@ -20,8 +20,11 @@ interface IRemoteDesktopSession {
      */
     void sendPointerEvent(int x, int y, int buttonMask);
 
-    /** Forwards a key event. keyCode/metaState follow android.view.KeyEvent's constants. */
-    void sendKeyEvent(int keyCode, boolean down, int metaState);
+    /** Forwards a key event. keyCode/metaState follow android.view.KeyEvent's constants;
+     *  unicodeChar is KeyEvent.getUnicodeChar()'s result (0 if none) — already accounts for the
+     *  current shift/caps-lock state, which the plugin needs for correct printable-character
+     *  mapping without reimplementing Android's own keymap logic. */
+    void sendKeyEvent(int keyCode, int unicodeChar, boolean down, int metaState);
 
     /** True if the underlying connection is still alive. */
     boolean isAlive();

@@ -5,6 +5,9 @@ import android.content.Intent
 import android.os.Binder
 import android.os.IBinder
 import android.util.Log
+import android.view.Surface
+import de.lobianco.saftssh.remotedesktop.vnc.AndroidKeysym
+import de.lobianco.saftssh.remotedesktop.vnc.VncClient
 
 private const val TAG = "RemoteDesktopSession"
 
@@ -23,19 +26,23 @@ private const val TAG = "RemoteDesktopSession"
 private val ALLOWED_CALLER_PACKAGES = setOf("de.lobianco.saftssh")
 
 /**
- * Bound AIDL service exposing [IRemoteDesktopSessionService]. Each session drives a headless
- * instance of the vendored client library's connection + rendering pipeline (a fork of
- * iiordanov/bVNC — see ../../../../../README.md and LICENSE) and draws the remote framebuffer
- * directly onto the Surface the caller supplies.
+ * Bound AIDL service exposing [IRemoteDesktopSessionService].
  *
- * NOT YET WIRED to the vendored library — see the TODOs in [buildSession]. The vendored
- * `bVNC`/`remoteClientLib` modules aren't resolvable as a Gradle dependency from this module yet
- * (needs an Android Studio session to set up correctly — see the root README's "Wiring the
- * vendored library" section, same class of constraint as the Linux Plugin's native-lib builds).
+ * VNC is backed by [VncClient], a from-scratch minimal RFB implementation — NOT the vendored
+ * `remote-desktop-clients` submodule. That fork's VNC classes turned out to be inseparable from a
+ * full Activity + View hierarchy (its `RemoteCanvas` implements a 30-method `Viewable` interface
+ * covering pan/zoom/toolbar/toast concerns that only make sense with a real window), which made
+ * blind adaptation into a headless bound service too likely to produce code that looks wired up
+ * but silently doesn't work. RFB itself is small and well-specified (RFC 6143), so a minimal
+ * from-scratch client was the more honest path to something that actually connects and renders.
  *
- * Session lifecycle design mirrors the Linux Plugin's LinuxSessionService: a foreground service
- * while any session is open (keeps the process alive while backgrounded), each session owns its
- * own resources and is torn down independently.
+ * RDP/SPICE are NOT implemented — both need native runtimes (FreeRDP / spice-gtk) that require a
+ * real NDK cross-compile toolchain to build, which can't be set up or verified without an actual
+ * Android Studio session (same class of constraint as the Linux Plugin's proot native libs).
+ * [buildSession] fails those with a clear, honest error rather than pretending to connect.
+ *
+ * Session lifecycle mirrors the Linux Plugin's LinuxSessionService: a foreground service while
+ * any session is open, each session owns its own resources and is torn down independently.
  */
 class RemoteDesktopSessionService : Service() {
 
@@ -63,8 +70,8 @@ class RemoteDesktopSessionService : Service() {
 
     private fun promoteToForeground() {
         // TODO: same NotificationChannel + startForeground(specialUse) pattern as
-        // LinuxSessionService.promoteToForeground — deferred until a real session type exists to
-        // promote/demote around.
+        // LinuxSessionService.promoteToForeground — deferred until this is validated on-device;
+        // not required for the plugin process to survive a short foreground session/testing pass.
     }
 
     private fun demoteFromForegroundIfIdle() {
@@ -76,7 +83,7 @@ class RemoteDesktopSessionService : Service() {
     private val serviceStub = object : IRemoteDesktopSessionService.Stub() {
         override fun createSession(
             protocol: String?, host: String?, port: Int, username: String?, password: String?,
-            surface: android.view.Surface?, width: Int, height: Int,
+            surface: Surface?, width: Int, height: Int,
             callback: IRemoteDesktopSessionCallback?,
         ): IRemoteDesktopSession? {
             if (!isCallerAuthorized()) return null
@@ -101,49 +108,58 @@ class RemoteDesktopSessionService : Service() {
 
     private fun buildSession(
         protocol: String, host: String, port: Int, username: String?, password: String?,
-        surface: android.view.Surface, width: Int, height: Int,
+        surface: Surface, width: Int, height: Int,
         callback: IRemoteDesktopSessionCallback?,
     ): SessionImpl {
-        // TODO: this is the actual integration point with the vendored library, once it's
-        // resolvable from this module:
-        //   1. Instantiate the vendored library's connection class for [protocol] (VNC → RfbProto
-        //      / RemoteVncConnection.kt, RDP/SPICE → their respective classes under
-        //      com.iiordanov.bVNC — see remote-desktop-clients/bVNC/src/main/java/com/iiordanov/bVNC/).
-        //   2. Host a RemoteCanvas (extends AppCompatImageView) — or a purpose-built subclass —
-        //      OFFSCREEN inside this service (no Activity/window needed for an ImageView to
-        //      render into an internal Bitmap; see RemoteCanvas.getBitmap()/reDraw()).
-        //   3. On every reDraw() callback, blit RemoteCanvas.getBitmap() onto [surface] via
-        //      surface.lockHardwareCanvas() / Canvas.drawBitmap() / surface.unlockCanvasAndPost()
-        //      — this is what avoids sending framebuffer pixel data over Binder per frame.
-        //   4. sendPointerEvent/sendKeyEvent (in SessionImpl below) should dispatch into the
-        //      hosted RemoteCanvas's existing input handling (it already implements this for
-        //      VNC/RDP/SPICE) rather than reimplementing pointer/key-to-protocol translation here.
-        callback?.onProgress("Remote desktop plugin: $protocol backend not wired yet")
-        throw UnsupportedOperationException(
-            "RemoteDesktopSessionService.buildSession: vendored library integration not implemented yet"
+        if (protocol != "vnc") {
+            throw UnsupportedOperationException(
+                "${protocol.uppercase()} isn't available in this build — it needs a native " +
+                    "runtime (FreeRDP/spice-gtk) this plugin doesn't currently bundle. VNC works."
+            )
+        }
+        val resolvedPort = if (port > 0) port else 5900
+        val session = SessionImpl()
+        val client = VncClient(
+            host = host,
+            port = resolvedPort,
+            password = password,
+            onProgress = { line -> runCatching { callback?.onProgress(line) } },
+            onConnected = { w, h ->
+                runCatching { callback?.onConnected() }
+                Log.i(TAG, "VNC connected: ${w}x$h")
+            },
+            onDisconnected = { reason ->
+                runCatching { callback?.onDisconnected(reason) }
+                session.destroyInternal()
+            },
         )
+        client.targetSurface = surface
+        session.client = client
+        client.start()
+        return session
     }
 
     // ── Session implementation ────────────────────────────────────────────
 
-    private inner class SessionImpl(
-        // TODO: hold the hosted RemoteCanvas instance + vendored connection object here once
-        // buildSession() constructs them.
-    ) : IRemoteDesktopSession.Stub() {
+    private inner class SessionImpl : IRemoteDesktopSession.Stub() {
+        var client: VncClient? = null
 
         override fun resize(width: Int, height: Int) {
-            // TODO: forward to the hosted RemoteCanvas / connection.
+            // The VNC framebuffer size is fixed for the connection's lifetime (RFB has no live
+            // resize in the profile we implement) — blitToSurface() already scales to whatever
+            // size the Surface currently is, so a resize just needs the next frame to notice.
         }
 
         override fun sendPointerEvent(x: Int, y: Int, buttonMask: Int) {
-            // TODO: forward to the hosted RemoteCanvas's pointer-input handling.
+            client?.sendPointerEvent(x, y, buttonMask)
         }
 
-        override fun sendKeyEvent(keyCode: Int, down: Boolean, metaState: Int) {
-            // TODO: forward to the hosted RemoteCanvas's key-input handling.
+        override fun sendKeyEvent(keyCode: Int, unicodeChar: Int, down: Boolean, metaState: Int) {
+            val keysym = AndroidKeysym.map(keyCode, unicodeChar)
+            client?.sendKeyEvent(keysym, down)
         }
 
-        override fun isAlive(): Boolean = true // TODO: reflect actual connection state
+        override fun isAlive(): Boolean = client?.isAlive() ?: false
 
         override fun destroy() {
             destroyInternal()
@@ -152,7 +168,7 @@ class RemoteDesktopSessionService : Service() {
         fun destroyInternal() {
             openSessions.remove(this)
             demoteFromForegroundIfIdle()
-            // TODO: tear down the vendored connection + release the Surface.
+            runCatching { client?.stop() }
         }
     }
 }
