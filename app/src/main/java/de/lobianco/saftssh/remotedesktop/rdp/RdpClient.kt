@@ -74,7 +74,20 @@ class RdpClient(
 
         LibFreeRDP.setUIEventListener(inst, object : LibFreeRDP.UIEventListener {
             override fun OnSettingsChanged(width: Int, height: Int, bpp: Int) {
+                // Fires ONCE on the initial connect (from android_post_connect in FreeRDP
+                // 2.11.7's android_freerdp.c) with the negotiated desktop size. THIS — not
+                // OnGraphicsResize — is where the framebuffer bitmap must be allocated:
+                // OnGraphicsResize only fires on a *later* server-initiated desktop resize
+                // (android_desktop_resize), so relying on it left the initial connect with no
+                // bitmap and a permanently blank screen. Confirmed against the actual native
+                // source + the reference SessionActivity, not guessed.
                 Log.i(TAG, "OnSettingsChanged: ${width}x$height @${bpp}bpp")
+                allocateFramebuffer(width, height)
+                if (!connected) {
+                    connected = true
+                    onProgress("Connected — ${width}x$height")
+                    onConnected(width, height)
+                }
             }
 
             override fun OnAuthenticate(
@@ -110,19 +123,19 @@ class RdpClient(
             ): Int = decideCertificateTrust(fingerprint)
 
             override fun OnGraphicsUpdate(x: Int, y: Int, width: Int, height: Int) {
+                // Pull the freshly-painted region out of FreeRDP's native GDI buffer into our
+                // bitmap (updateGraphics must be called per-update — it's what actually copies
+                // pixels; without it the bitmap never receives any content), then draw.
+                val bmp = bitmap ?: return
+                LibFreeRDP.updateGraphics(inst, bmp, x, y, width, height)
                 blitToSurface()
             }
 
             override fun OnGraphicsResize(width: Int, height: Int, bpp: Int) {
+                // Later server-initiated desktop resize only — replace the bitmap with the new
+                // size. Initial allocation happens in OnSettingsChanged (see there).
                 Log.i(TAG, "OnGraphicsResize: ${width}x$height @${bpp}bpp")
-                val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                bitmap = bmp
-                LibFreeRDP.updateGraphics(inst, bmp, 0, 0, width, height)
-                if (!connected) {
-                    connected = true
-                    onProgress("Connected — ${width}x$height")
-                    onConnected(width, height)
-                }
+                allocateFramebuffer(width, height)
             }
 
             override fun OnRemoteClipboardChanged(data: String?) {}
@@ -174,6 +187,14 @@ class RdpClient(
             val success = LibFreeRDP.connect(inst)
             if (!success) onDisconnected("Connection failed")
         }, "RdpClient-$host:$port").apply { isDaemon = true; start() }
+    }
+
+    /** (Re)allocates the framebuffer bitmap the native GDI buffer is copied into. Always
+     *  ARGB_8888 — jni_freerdp_update_graphics maps that to PIXEL_FORMAT_RGBX32, a direct match
+     *  for the GDI primary buffer (gdi_init uses RGBX32), so it works regardless of the remote's
+     *  negotiated colour depth; no need for the reference client's RGB_565-for-16bpp branch. */
+    private fun allocateFramebuffer(width: Int, height: Int) {
+        bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
     }
 
     /** Returns 1 (accept) only if [fingerprint] matches what's already trusted for this host;
