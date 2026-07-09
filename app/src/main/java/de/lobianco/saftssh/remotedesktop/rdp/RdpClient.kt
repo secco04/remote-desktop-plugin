@@ -63,6 +63,12 @@ class RdpClient(
     // RDP has no "no buttons" release, the button flag must be repeated on the up event.
     @Volatile private var lastButtonDown = false
 
+    /** Throws if the connection parameters are rejected before the connect thread even starts
+     *  (e.g. a malformed URI) — the caller (RemoteDesktopSessionService.buildSession) must let
+     *  this fail createSession() outright rather than handing back a session handle for a
+     *  connection that already died, which would otherwise race the AIDL onDisconnected callback
+     *  against createSession()'s own return and could leave the UI showing "Connected" for a
+     *  session that never actually started. */
     fun start() {
         inst = LibFreeRDP.newInstance(context)
 
@@ -126,12 +132,18 @@ class RdpClient(
         // each query parameter becomes a `/key:value` (or `/key`/`-key`/`+key`) FreeRDP CLI flag.
         // Deliberately NOT passing "cert=ignore" — certificate trust is handled explicitly via
         // decideCertificateTrust()/RdpCertStore instead (see the class doc for why).
+        // Deliberately no /kbd query param: FreeRDP 2.11.7's /kbd expects a numeric keyboard
+        // layout ID or a known layout name (see client/common/cmdline.c's "kbd" case, which
+        // rejects anything else with COMMAND_LINE_ERROR_UNEXPECTED_VALUE — a value like
+        // "unicode:on" made freerdp_parse_arguments() fail outright, so setConnectionInfo()
+        // returned false and the connect thread never started). There's no CLI flag needed to
+        // "enable" Unicode keyboard input in this version — sendUnicodeKeyEvent() works
+        // independently of the negotiated keyboard layout, which only matters for scancodes.
         val uriBuilder = Uri.Builder()
             .scheme("freerdp")
             .encodedAuthority(buildAuthority())
             .appendQueryParameter("size", "1280x800") // renegotiated via OnGraphicsResize anyway
             .appendQueryParameter("bpp", "32")
-            .appendQueryParameter("kbd", "unicode:on")
             .appendQueryParameter("clipboard", "")
             .appendQueryParameter("sec", "nla") // most modern Windows hosts require NLA by default
 
@@ -141,8 +153,7 @@ class RdpClient(
         onProgress("Connecting to $host:$port…")
         val ok = LibFreeRDP.setConnectionInfo(context, inst, uri)
         if (!ok) {
-            onDisconnected("Failed to parse connection parameters")
-            return
+            throw IllegalStateException("Failed to parse connection parameters")
         }
 
         LibFreeRDP.setEventListener(object : LibFreeRDP.EventListener {

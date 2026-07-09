@@ -164,7 +164,16 @@ class RemoteDesktopSessionService : Service() {
                 )
                 client.targetSurface = surface
                 session.rdpClient = client
-                client.start()
+                try {
+                    client.start()
+                } catch (e: Exception) {
+                    // start() throws on a synchronous setup failure (e.g. malformed connection
+                    // parameters) before the connect thread ever runs — free the native FreeRDP
+                    // instance it already allocated instead of leaking it, then let the caller
+                    // (createSession's own try/catch) turn this into a clean null return.
+                    runCatching { client.stop() }
+                    throw e
+                }
             }
             else -> throw UnsupportedOperationException(
                 "${protocol.uppercase()} isn't available in this build — it needs a native " +
