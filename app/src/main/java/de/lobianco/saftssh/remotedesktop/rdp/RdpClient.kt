@@ -2,7 +2,8 @@ package de.lobianco.saftssh.remotedesktop.rdp
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.Rect
+import android.graphics.Color
+import android.graphics.RectF
 import android.net.Uri
 import android.util.Log
 import android.view.Surface
@@ -51,6 +52,16 @@ class RdpClient(
     private var thread: Thread? = null
 
     @Volatile var targetSurface: Surface? = null
+
+    // Letterbox render geometry (see VncClient for the same reasoning) — used to inverse-map
+    // Surface-pixel touch coordinates back to remote-desktop pixels in sendPointerEvent.
+    @Volatile private var renderScale = 1f
+    @Volatile private var renderOffsetX = 0f
+    @Volatile private var renderOffsetY = 0f
+    // Tracks whether the left button was down on the previous pointer event, so a press→release
+    // transition can emit an explicit RDP button-up (PTR_FLAGS_BUTTON1 without PTR_FLAGS_DOWN) —
+    // RDP has no "no buttons" release, the button flag must be repeated on the up event.
+    @Volatile private var lastButtonDown = false
 
     fun start() {
         inst = LibFreeRDP.newInstance(context)
@@ -180,8 +191,17 @@ class RdpClient(
     fun isAlive(): Boolean = connected
 
     fun sendPointerEvent(x: Int, y: Int, buttonMask: Int) {
-        val flags = PTR_FLAGS_MOVE or if (buttonMask and 1 != 0) (PTR_FLAGS_DOWN or PTR_FLAGS_BUTTON1) else 0
-        runCatching { LibFreeRDP.sendCursorEvent(inst, x, y, flags) }
+        val bmp = bitmap
+        val mx = if (bmp != null) ((x - renderOffsetX) / renderScale).toInt().coerceIn(0, bmp.width - 1) else x
+        val my = if (bmp != null) ((y - renderOffsetY) / renderScale).toInt().coerceIn(0, bmp.height - 1) else y
+        val down = buttonMask and 1 != 0
+        val flags = when {
+            down -> PTR_FLAGS_MOVE or PTR_FLAGS_DOWN or PTR_FLAGS_BUTTON1 // press or drag
+            lastButtonDown -> PTR_FLAGS_BUTTON1 // release (button flag without DOWN = button-up)
+            else -> PTR_FLAGS_MOVE // hover / move with no button
+        }
+        lastButtonDown = down
+        runCatching { LibFreeRDP.sendCursorEvent(inst, mx, my, flags) }
     }
 
     fun sendKeyEvent(keyCode: Int, unicodeChar: Int, down: Boolean) {
@@ -199,7 +219,19 @@ class RdpClient(
         try {
             val canvas = surface.lockCanvas(null) ?: return
             try {
-                canvas.drawBitmap(bmp, null, Rect(0, 0, canvas.width, canvas.height), null)
+                // Letterbox to preserve aspect ratio — same approach as VncClient.blitToSurface.
+                val sw = canvas.width
+                val sh = canvas.height
+                val scale = minOf(sw.toFloat() / bmp.width, sh.toFloat() / bmp.height)
+                val dw = bmp.width * scale
+                val dh = bmp.height * scale
+                val ox = (sw - dw) / 2f
+                val oy = (sh - dh) / 2f
+                renderScale = scale
+                renderOffsetX = ox
+                renderOffsetY = oy
+                canvas.drawColor(Color.BLACK)
+                canvas.drawBitmap(bmp, null, RectF(ox, oy, ox + dw, oy + dh), null)
             } finally {
                 surface.unlockCanvasAndPost(canvas)
             }

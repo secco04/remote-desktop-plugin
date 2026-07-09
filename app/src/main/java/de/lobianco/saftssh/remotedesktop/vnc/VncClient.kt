@@ -2,7 +2,9 @@ package de.lobianco.saftssh.remotedesktop.vnc
 
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Rect
+import android.graphics.RectF
 import android.util.Log
 import android.view.Surface
 import java.io.BufferedInputStream
@@ -56,6 +58,15 @@ class VncClient(
      *  wire-protocol logic. */
     @Volatile var targetSurface: Surface? = null
 
+    // Render geometry from the most recent blit — the framebuffer is drawn letterboxed (aspect
+    // ratio preserved) into the Surface, so incoming touch coordinates (which are in Surface
+    // pixels) must be inverse-transformed back to framebuffer pixels before being sent as pointer
+    // events. Without this, touches in the letterbox bars / beyond the scaled image clamp to the
+    // edge and the remote cursor barely moves.
+    @Volatile private var renderScale = 1f
+    @Volatile private var renderOffsetX = 0f
+    @Volatile private var renderOffsetY = 0f
+
     fun start() {
         if (running) return
         running = true
@@ -72,15 +83,19 @@ class VncClient(
 
     // ── Input ──────────────────────────────────────────────────────────────
 
-    /** RFB PointerEvent (message type 5). [buttonMask] bit 0 = primary button. */
+    /** RFB PointerEvent (message type 5). [x]/[y] are Surface-local pixels (as delivered by the
+     *  hosting SurfaceView's touch listener); they're mapped back through the current letterbox
+     *  geometry to framebuffer pixels here. [buttonMask] bit 0 = primary button. */
     fun sendPointerEvent(x: Int, y: Int, buttonMask: Int) {
         val out = output ?: return
+        val fbX = ((x - renderOffsetX) / renderScale).toInt().coerceIn(0, fbWidth.coerceAtLeast(1) - 1)
+        val fbY = ((y - renderOffsetY) / renderScale).toInt().coerceIn(0, fbHeight.coerceAtLeast(1) - 1)
         try {
             synchronized(out) {
                 out.writeByte(5)
                 out.writeByte(buttonMask)
-                out.writeShort(x.coerceIn(0, fbWidth.coerceAtLeast(1) - 1))
-                out.writeShort(y.coerceIn(0, fbHeight.coerceAtLeast(1) - 1))
+                out.writeShort(fbX)
+                out.writeShort(fbY)
                 out.flush()
             }
         } catch (e: IOException) {
@@ -343,11 +358,23 @@ class VncClient(
         try {
             val canvas = surface.lockCanvas(null) ?: return
             try {
-                // Scale the whole framebuffer to fill the current Surface size — simplest
-                // correct behavior for a first version; no independent pan/zoom yet (that's a
-                // RemoteDesktopScreen-side concern for later, same as the Linux Plugin's PTY
-                // resize path).
-                canvas.drawBitmap(fb, null, Rect(0, 0, canvas.width, canvas.height), null)
+                // Letterbox: scale the framebuffer to fit the Surface while preserving its aspect
+                // ratio (min of the two axis scales), centered, with black bars filling the rest.
+                // Stretching to fill both axes independently is what made the remote desktop look
+                // squashed. The chosen scale/offset are stored for sendPointerEvent's inverse
+                // mapping. (No independent pan/zoom yet — a RemoteDesktopScreen-side concern.)
+                val sw = canvas.width
+                val sh = canvas.height
+                val scale = minOf(sw.toFloat() / fb.width, sh.toFloat() / fb.height)
+                val dw = fb.width * scale
+                val dh = fb.height * scale
+                val ox = (sw - dw) / 2f
+                val oy = (sh - dh) / 2f
+                renderScale = scale
+                renderOffsetX = ox
+                renderOffsetY = oy
+                canvas.drawColor(Color.BLACK)
+                canvas.drawBitmap(fb, null, RectF(ox, oy, ox + dw, oy + dh), null)
             } finally {
                 surface.unlockCanvasAndPost(canvas)
             }
