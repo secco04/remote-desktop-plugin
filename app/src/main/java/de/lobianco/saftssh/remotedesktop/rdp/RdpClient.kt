@@ -78,18 +78,19 @@ class RdpClient(
                 usernameOut: StringBuilder, domainOut: StringBuilder, passwordOut: StringBuilder,
             ): Boolean = OnAuthenticate(usernameOut, domainOut, passwordOut)
 
-            override fun OnVerifiyCertificateEx(
-                certHost: String?, certPort: Long, commonName: String?, subject: String?,
-                issuer: String?, fingerprint: String?, flags: Long,
+            // Note the misspelled method name ("Verifiy") — matches FreeRDP 2.11.7's
+            // UIEventListener interface exactly, since that's the version the vendored
+            // native libraries were built from (see LibFreeRDP.java's class doc). No certPort/
+            // flags params either — that's a newer-FreeRDP addition this build predates.
+            override fun OnVerifiyCertificate(
+                commonName: String?, subject: String?, issuer: String?, fingerprint: String?,
+                mismatch: Boolean,
             ): Int = decideCertificateTrust(fingerprint)
 
-            override fun OnVerifyChangedCertificateEx(
-                certHost: String?, certPort: Long, commonName: String?, subject: String?,
-                issuer: String?, fingerprint: String?, oldSubject: String?, oldIssuer: String?,
-                oldFingerprint: String?, flags: Long,
+            override fun OnVerifyChangedCertificate(
+                commonName: String?, subject: String?, issuer: String?, fingerprint: String?,
+                oldSubject: String?, oldIssuer: String?, oldFingerprint: String?,
             ): Int = decideCertificateTrust(fingerprint)
-
-            override fun OnExperimentalFeature(feature: Int): Boolean = false
 
             override fun OnGraphicsUpdate(x: Int, y: Int, width: Int, height: Int) {
                 blitToSurface()
@@ -108,16 +109,6 @@ class RdpClient(
             }
 
             override fun OnRemoteClipboardChanged(data: String?) {}
-            override fun OnRemoteClipboardImageChanged(data: ByteArray?) {}
-            override fun OnPointerSet(pixels: IntArray?, width: Int, height: Int, hotX: Int, hotY: Int) {}
-            override fun OnPointerSetNull() {}
-            override fun OnPointerSetDefault() {}
-            override fun OnRailWindowUpdate(windowId: Long, width: Int, height: Int, pixels: IntArray?) {}
-            override fun OnRailWindowMove(windowId: Long, x: Int, y: Int, w: Int, h: Int) {}
-            override fun OnRailWindowHide(windowId: Long) {}
-            override fun OnRailWindowDestroy(windowId: Long) {}
-            override fun OnRailSessionEnd() {}
-            override fun OnRailMonitoredDesktop(windowIds: LongArray?, activeWindowId: Long) {}
         })
 
         // Build the connection as a freerdp:// URI — see LibFreeRDP.setConnectionInfo(Uri)'s doc:

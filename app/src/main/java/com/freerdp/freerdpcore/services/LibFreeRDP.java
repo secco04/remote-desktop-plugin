@@ -12,20 +12,33 @@
    plugin is GPL-3.0, see this repo's LICENSE, MPL/GPL combination is expressly permitted
    by MPL 2.0 section 3.3):
 
-   Vendored from FreeRDP's own upstream Android client
-   (https://github.com/FreeRDP/FreeRDP/blob/master/client/Android/Studio/freeRDPCore/src/main/java/com/freerdp/freerdpcore/services/LibFreeRDP.java),
+   Vendored from FreeRDP's own upstream Android client at tag 2.11.7 (NOT master —
+   the prebuilt native libraries bundled in this plugin were built from that exact
+   tag per iiordanov/remote-desktop-clients' own build-deps.conf, and FreeRDP's
+   Android JNI surface has changed since; an earlier version of this file was
+   mistakenly vendored from current master and crashed at runtime with
+   "Failed to register native method ... freerdp_get_build_date" because the
+   native library's JNI_OnLoad batch-registers ALL its native methods against this
+   class in one call, and no static/native method here matched
+   freerdp_get_build_date — RegisterNatives has no partial-success mode, so a
+   single unresolvable entry aborts the whole batch):
+   https://github.com/FreeRDP/FreeRDP/blob/2.11.7/client/Android/Studio/freeRDPCore/src/main/java/com/freerdp/freerdpcore/services/LibFreeRDP.java
    NOT from the bVNC fork — this is FreeRDP's own JNI bridge, license-clean and
-   independent of bVNC's GPL-3.0 codebase. Package/class name is UNCHANGED
-   (com.freerdp.freerdpcore.services.LibFreeRDP) because the native library's
-   JNI_OnLoad registers its native methods against this exact class via
+   independent of bVNC's GPL-3.0 codebase (verified none of bVNC's ~20 build
+   patches touch this file's native method declarations or the OnXxx callback
+   methods native code invokes by name — they only touch the BookmarkBase-based
+   setConnectionInfo() path this file doesn't even keep). Package/class name is
+   UNCHANGED (com.freerdp.freerdpcore.services.LibFreeRDP) because the native
+   library's JNI_OnLoad registers its native methods against this exact class via
    RegisterNatives() — renaming or moving this class would break that binding
    (confirmed by inspecting the compiled classes.dex of a real freeaRDP release
    APK, which reports this exact package/class, not a guess).
 
    Changes from upstream:
-   - Removed the BookmarkBase-based setConnectionInfo() overload and its BookmarkBase
-     import — that class belongs to FreeRDP's own bookmark-management UI layer, which
-     this plugin doesn't use; only the simpler Uri-based overload is needed.
+   - Removed the BookmarkBase-based setConnectionInfo() overload and its BookmarkBase/
+     ManualBookmark imports — that class belongs to FreeRDP's own bookmark-management
+     UI layer, which this plugin doesn't use; only the simpler Uri-based overload is
+     kept, unchanged.
    - Removed the ApplicationSettingsActivity dependency (only used for a client
      hostname string) — replaced with a plain constant.
    - Replaced the GlobalApp/SessionState-based callback dispatch (which required
@@ -33,8 +46,10 @@
      per-instance UIEventListener map this plugin owns directly
      (setUIEventListener/removeUIEventListener below) — same information, no extra
      vendored classes.
-   All native method declarations and both listener interfaces are UNCHANGED from
-   upstream, since those must match exactly what the native library expects/provides.
+   Every native method declaration and both listener interfaces (including the
+   exact method names/signatures native code calls back into, like the misspelled
+   "OnVerifiyCertificate") are UNCHANGED from upstream 2.11.7, since those must
+   match exactly what the native library expects/provides.
 */
 
 package com.freerdp.freerdpcore.services;
@@ -56,39 +71,16 @@ public class LibFreeRDP
 	private static final String CLIENT_NAME = "LobiShell";
 	private static EventListener listener;
 	private static boolean mHasH264 = false;
-	private static boolean mHasCameraRedirection = false;
 
 	private static final LongSparseArray<Boolean> mInstanceState = new LongSparseArray<>();
 	private static final LongSparseArray<UIEventListener> mUiListeners = new LongSparseArray<>();
-
-	public static final long VERIFY_CERT_FLAG_NONE = 0x00;
-	public static final long VERIFY_CERT_FLAG_LEGACY = 0x02;
-	public static final long VERIFY_CERT_FLAG_REDIRECT = 0x10;
-	public static final long VERIFY_CERT_FLAG_GATEWAY = 0x20;
-	public static final long VERIFY_CERT_FLAG_CHANGED = 0x40;
-	public static final long VERIFY_CERT_FLAG_MISMATCH = 0x80;
-	public static final long VERIFY_CERT_FLAG_MATCH_LEGACY_SHA1 = 0x100;
-	public static final long VERIFY_CERT_FLAG_FP_IS_PEM = 0x200;
-
-	// Keep in sync with android_freerdp.c.
-	public static final int EXPERIMENTAL_REMOTEAPP = 0;
-	public static final int EXPERIMENTAL_CAMERA = 1;
 
 	static
 	{
 		try
 		{
 			System.loadLibrary("freerdp-android");
-
-			/* Load dependent libraries too to trigger JNI_OnLoad calls */
 			String version = freerdp_get_jni_version();
-			String[] versions = version.split("[\\.-]");
-			if (versions.length > 0)
-			{
-				System.loadLibrary("freerdp-client" + versions[0]);
-				System.loadLibrary("freerdp" + versions[0]);
-				System.loadLibrary("winpr" + versions[0]);
-			}
 			Pattern pattern = Pattern.compile("^(\\d+)\\.(\\d+)\\.(\\d+).*");
 			Matcher matcher = pattern.matcher(version);
 			if (!matcher.matches() || (matcher.groupCount() < 3))
@@ -107,14 +99,12 @@ public class LibFreeRDP
 			else
 				throw new RuntimeException("APK broken: native library version " + version +
 				                           " does not meet requirements!");
-			mHasCameraRedirection = freerdp_has_camera_redirection();
 			Log.i(TAG, "Successfully loaded native library. H264 is " +
-			               (mHasH264 ? "supported" : "not available") + ", camera redirection is " +
-			               (mHasCameraRedirection ? "supported" : "not available"));
+			               (mHasH264 ? "supported" : "not available"));
 		}
 		catch (UnsatisfiedLinkError e)
 		{
-			Log.e(TAG, "Failed to load library: " + e);
+			Log.e(TAG, "Failed to load library: " + e.toString());
 			throw e;
 		}
 	}
@@ -124,18 +114,13 @@ public class LibFreeRDP
 		return mHasH264;
 	}
 
-	public static boolean hasCameraRedirectionSupport()
-	{
-		return mHasCameraRedirection;
-	}
-
 	private static native boolean freerdp_has_h264();
-
-	private static native boolean freerdp_has_camera_redirection();
 
 	private static native String freerdp_get_jni_version();
 
 	private static native String freerdp_get_version();
+
+	private static native String freerdp_get_build_date();
 
 	private static native String freerdp_get_build_revision();
 
@@ -161,14 +146,7 @@ public class LibFreeRDP
 	private static native boolean freerdp_send_unicodekey_event(long inst, int keycode,
 	                                                            boolean down);
 
-	private static native boolean freerdp_is_unicode_input_supported(long inst);
-
 	private static native boolean freerdp_send_clipboard_data(long inst, String data);
-
-	private static native boolean freerdp_send_clipboard_image_data(long inst, byte[] data,
-	                                                                String mimeType);
-
-	private static native boolean freerdp_send_monitor_layout(long inst, int width, int height);
 
 	private static native String freerdp_get_last_error_string(long inst);
 
@@ -177,8 +155,9 @@ public class LibFreeRDP
 		listener = l;
 	}
 
-	/** LobiShell addition — see the class doc: replaces GlobalApp/SessionState. Call before
-	 *  [connect]; the callbacks below look this up by instance handle. */
+	/** Registers the [UIEventListener] for a given instance — replaces upstream's
+	 *  GlobalApp/SessionState session registry (see class doc). Must be called before
+	 *  connect() so the OnXxx callbacks below have somewhere to dispatch to. */
 	public static void setUIEventListener(long inst, UIEventListener l)
 	{
 		synchronized (mUiListeners)
@@ -187,7 +166,7 @@ public class LibFreeRDP
 		}
 	}
 
-	/** LobiShell addition — call from [freeInstance]'s caller once the session is torn down. */
+	/** Call once the session is torn down to release the listener reference. */
 	public static void removeUIEventListener(long inst)
 	{
 		synchronized (mUiListeners)
@@ -258,7 +237,14 @@ public class LibFreeRDP
 
 	public static boolean cancelConnection(long inst)
 	{
-		return freerdp_disconnect(inst);
+		synchronized (mInstanceState)
+		{
+			if (mInstanceState.get(inst, false))
+			{
+				return freerdp_disconnect(inst);
+			}
+			return true;
+		}
 	}
 
 	public static boolean setConnectionInfo(Context context, long inst, Uri openUri)
@@ -271,14 +257,18 @@ public class LibFreeRDP
 		// Now we only support Software GDI
 		args.add(TAG);
 		args.add("/gdi:sw");
-		args.add("/client-hostname:" + CLIENT_NAME);
+
+		if (!CLIENT_NAME.isEmpty())
+		{
+			args.add("/client-hostname:" + CLIENT_NAME);
+		}
 
 		// Parse hostname and port. Set to 'v' argument
 		String hostname = openUri.getHost();
 		int port = openUri.getPort();
 		if (hostname != null)
 		{
-			hostname = hostname + ((port == -1) ? "" : (":" + port));
+			hostname = hostname + ((port == -1) ? "" : (":" + String.valueOf(port)));
 			args.add("/v:" + hostname);
 		}
 
@@ -319,7 +309,7 @@ public class LibFreeRDP
 			}
 		}
 
-		String[] arrayArgs = args.toArray(new String[0]);
+		String[] arrayArgs = args.toArray(new String[args.size()]);
 		return freerdp_parse_arguments(inst, arrayArgs);
 	}
 
@@ -344,24 +334,9 @@ public class LibFreeRDP
 		return freerdp_send_unicodekey_event(inst, keycode, down);
 	}
 
-	public static boolean isUnicodeInputSupported(long inst)
-	{
-		return freerdp_is_unicode_input_supported(inst);
-	}
-
 	public static boolean sendClipboardData(long inst, String data)
 	{
 		return freerdp_send_clipboard_data(inst, data);
-	}
-
-	public static boolean sendClipboardImageData(long inst, byte[] data, String mimeType)
-	{
-		return freerdp_send_clipboard_image_data(inst, data, mimeType);
-	}
-
-	public static boolean sendMonitorLayout(long inst, int width, int height)
-	{
-		return freerdp_send_monitor_layout(inst, width, height);
 	}
 
 	private static void OnConnectionSuccess(long inst)
@@ -411,151 +386,70 @@ public class LibFreeRDP
 
 	private static void OnSettingsChanged(long inst, int width, int height, int bpp)
 	{
-		UIEventListener l = uiListenerFor(inst);
-		if (l != null)
-			l.OnSettingsChanged(width, height, bpp);
+		UIEventListener uiEventListener = uiListenerFor(inst);
+		if (uiEventListener != null)
+			uiEventListener.OnSettingsChanged(width, height, bpp);
 	}
 
 	private static boolean OnAuthenticate(long inst, StringBuilder username, StringBuilder domain,
 	                                      StringBuilder password)
 	{
-		UIEventListener l = uiListenerFor(inst);
-		if (l != null)
-			return l.OnAuthenticate(username, domain, password);
+		UIEventListener uiEventListener = uiListenerFor(inst);
+		if (uiEventListener != null)
+			return uiEventListener.OnAuthenticate(username, domain, password);
 		return false;
 	}
 
 	private static boolean OnGatewayAuthenticate(long inst, StringBuilder username,
 	                                             StringBuilder domain, StringBuilder password)
 	{
-		UIEventListener l = uiListenerFor(inst);
-		if (l != null)
-			return l.OnGatewayAuthenticate(username, domain, password);
+		UIEventListener uiEventListener = uiListenerFor(inst);
+		if (uiEventListener != null)
+			return uiEventListener.OnGatewayAuthenticate(username, domain, password);
 		return false;
 	}
 
-	private static int OnVerifyCertificateEx(long inst, String host, long port, String commonName,
-	                                       String subject, String issuer, String fingerprint,
-	                                       long flags)
+	private static int OnVerifyCertificate(long inst, String commonName, String subject,
+	                                       String issuer, String fingerprint, boolean hostMismatch)
 	{
-		UIEventListener l = uiListenerFor(inst);
-		if (l != null)
-			return l.OnVerifiyCertificateEx(host, port, commonName, subject, issuer, fingerprint, flags);
+		UIEventListener uiEventListener = uiListenerFor(inst);
+		if (uiEventListener != null)
+			return uiEventListener.OnVerifiyCertificate(commonName, subject, issuer, fingerprint,
+			                                            hostMismatch);
 		return 0;
 	}
 
-	private static int OnVerifyChangedCertificateEx(long inst, String host, long port,
-	                                                String commonName, String subject,
-	                                                String issuer, String fingerprint,
-	                                                String oldSubject, String oldIssuer,
-	                                                String oldFingerprint, long flags)
+	private static int OnVerifyChangedCertificate(long inst, String commonName, String subject,
+	                                              String issuer, String fingerprint,
+	                                              String oldSubject, String oldIssuer,
+	                                              String oldFingerprint)
 	{
-		UIEventListener l = uiListenerFor(inst);
-		if (l != null)
-			return l.OnVerifyChangedCertificateEx(host, port, commonName, subject, issuer,
-			                                      fingerprint, oldSubject, oldIssuer, oldFingerprint, flags);
+		UIEventListener uiEventListener = uiListenerFor(inst);
+		if (uiEventListener != null)
+			return uiEventListener.OnVerifyChangedCertificate(
+			    commonName, subject, issuer, fingerprint, oldSubject, oldIssuer, oldFingerprint);
 		return 0;
-	}
-
-	private static boolean OnExperimentalFeature(long inst, int feature)
-	{
-		UIEventListener l = uiListenerFor(inst);
-		if (l == null)
-			return true;
-		return l.OnExperimentalFeature(feature);
 	}
 
 	private static void OnGraphicsUpdate(long inst, int x, int y, int width, int height)
 	{
-		UIEventListener l = uiListenerFor(inst);
-		if (l != null)
-			l.OnGraphicsUpdate(x, y, width, height);
+		UIEventListener uiEventListener = uiListenerFor(inst);
+		if (uiEventListener != null)
+			uiEventListener.OnGraphicsUpdate(x, y, width, height);
 	}
 
 	private static void OnGraphicsResize(long inst, int width, int height, int bpp)
 	{
-		UIEventListener l = uiListenerFor(inst);
-		if (l != null)
-			l.OnGraphicsResize(width, height, bpp);
+		UIEventListener uiEventListener = uiListenerFor(inst);
+		if (uiEventListener != null)
+			uiEventListener.OnGraphicsResize(width, height, bpp);
 	}
 
 	private static void OnRemoteClipboardChanged(long inst, String data)
 	{
-		UIEventListener l = uiListenerFor(inst);
-		if (l != null)
-			l.OnRemoteClipboardChanged(data);
-	}
-
-	private static void OnRemoteClipboardImageChanged(long inst, byte[] data)
-	{
-		UIEventListener l = uiListenerFor(inst);
-		if (l != null)
-			l.OnRemoteClipboardImageChanged(data);
-	}
-
-	private static void OnPointerSet(long inst, int[] pixels, int width, int height, int hotX,
-	                                 int hotY)
-	{
-		UIEventListener l = uiListenerFor(inst);
-		if (l != null)
-			l.OnPointerSet(pixels, width, height, hotX, hotY);
-	}
-
-	private static void OnPointerSetNull(long inst)
-	{
-		UIEventListener l = uiListenerFor(inst);
-		if (l != null)
-			l.OnPointerSetNull();
-	}
-
-	private static void OnPointerSetDefault(long inst)
-	{
-		UIEventListener l = uiListenerFor(inst);
-		if (l != null)
-			l.OnPointerSetDefault();
-	}
-
-	private static void OnRailWindowUpdate(long inst, long windowId, int width, int height,
-	                                       int[] pixels)
-	{
-		UIEventListener l = uiListenerFor(inst);
-		if (l != null)
-			l.OnRailWindowUpdate(windowId, width, height, pixels);
-	}
-
-	private static void OnRailWindowMove(long inst, long windowId, int x, int y, int w, int h)
-	{
-		UIEventListener l = uiListenerFor(inst);
-		if (l != null)
-			l.OnRailWindowMove(windowId, x, y, w, h);
-	}
-
-	private static void OnRailWindowHide(long inst, long windowId)
-	{
-		UIEventListener l = uiListenerFor(inst);
-		if (l != null)
-			l.OnRailWindowHide(windowId);
-	}
-
-	private static void OnRailWindowDestroy(long inst, long windowId)
-	{
-		UIEventListener l = uiListenerFor(inst);
-		if (l != null)
-			l.OnRailWindowDestroy(windowId);
-	}
-
-	private static void OnRailSessionEnd(long inst)
-	{
-		UIEventListener l = uiListenerFor(inst);
-		if (l != null)
-			l.OnRailSessionEnd();
-	}
-
-	private static void OnRailMonitoredDesktop(long inst, long[] windowIds, long activeWindowId)
-	{
-		UIEventListener l = uiListenerFor(inst);
-		if (l != null)
-			l.OnRailMonitoredDesktop(windowIds, activeWindowId);
+		UIEventListener uiEventListener = uiListenerFor(inst);
+		if (uiEventListener != null)
+			uiEventListener.OnRemoteClipboardChanged(data);
 	}
 
 	public static String getVersion()
@@ -563,8 +457,7 @@ public class LibFreeRDP
 		return freerdp_get_version();
 	}
 
-	public interface EventListener
-	{
+	public static interface EventListener {
 		void OnPreConnect(long instance);
 
 		void OnConnectionSuccess(long instance);
@@ -576,8 +469,7 @@ public class LibFreeRDP
 		void OnDisconnected(long instance);
 	}
 
-	public interface UIEventListener
-	{
+	public static interface UIEventListener {
 		void OnSettingsChanged(int width, int height, int bpp);
 
 		boolean OnAuthenticate(StringBuilder username, StringBuilder domain,
@@ -586,39 +478,17 @@ public class LibFreeRDP
 		boolean OnGatewayAuthenticate(StringBuilder username, StringBuilder domain,
 		                              StringBuilder password);
 
-		int OnVerifiyCertificateEx(String host, long port, String commonName, String subject, String issuer,
-		                         String fingerprint, long flags);
+		int OnVerifiyCertificate(String commonName, String subject, String issuer,
+		                         String fingerprint, boolean mismatch);
 
-		int OnVerifyChangedCertificateEx(String host, long port, String commonName, String subject, String issuer,
+		int OnVerifyChangedCertificate(String commonName, String subject, String issuer,
 		                               String fingerprint, String oldSubject, String oldIssuer,
-		                               String oldFingerprint, long flags);
-
-		boolean OnExperimentalFeature(int feature);
+		                               String oldFingerprint);
 
 		void OnGraphicsUpdate(int x, int y, int width, int height);
 
 		void OnGraphicsResize(int width, int height, int bpp);
 
 		void OnRemoteClipboardChanged(String data);
-
-		void OnRemoteClipboardImageChanged(byte[] data);
-
-		void OnPointerSet(int[] pixels, int width, int height, int hotX, int hotY);
-
-		void OnPointerSetNull();
-
-		void OnPointerSetDefault();
-
-		void OnRailWindowUpdate(long windowId, int width, int height, int[] pixels);
-
-		void OnRailWindowMove(long windowId, int x, int y, int w, int h);
-
-		void OnRailWindowHide(long windowId);
-
-		void OnRailWindowDestroy(long windowId);
-
-		void OnRailSessionEnd();
-
-		void OnRailMonitoredDesktop(long[] windowIds, long activeWindowId);
 	}
 }
