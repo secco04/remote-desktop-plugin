@@ -15,13 +15,23 @@ interface IRemoteDesktopSession {
 
     /**
      * Forwards a pointer/touch event. x/y are Surface-local pixels (the plugin maps them to
-     * framebuffer coordinates via its current letterbox geometry). buttonMask bit 0 =
-     * primary/left button/tap down.
+     * framebuffer coordinates via its current letterbox+zoom geometry, see [setZoom]).
+     * buttonMask follows the RFC 6143 (VNC) convention every real VNC/RDP client uses: bit 0 =
+     * left button, bit 1 = middle, bit 2 = right.
      *
      * oneway: high-frequency input must not block the caller's UI thread on a synchronous Binder
      * round-trip per touch move, and there's no return value to wait for — fire-and-forget.
      */
     oneway void sendPointerEvent(int x, int y, int buttonMask);
+
+    /**
+     * Sets the pinch-zoom scale and pan offset the plugin should apply on top of its base
+     * letterbox fit when next drawing a frame, and use to inverse-map subsequent
+     * [sendPointerEvent] coordinates. [scale] is relative to the base letterbox fit (1.0 = no
+     * extra zoom); [panX]/[panY] are Surface-local pixel offsets. oneway for the same reason as
+     * sendPointerEvent — sent continuously while the user's fingers move.
+     */
+    oneway void setZoom(float scale, float panX, float panY);
 
     /** Forwards a key event. keyCode/metaState follow android.view.KeyEvent's constants;
      *  unicodeChar is KeyEvent.getUnicodeChar()'s result (0 if none) — already accounts for the

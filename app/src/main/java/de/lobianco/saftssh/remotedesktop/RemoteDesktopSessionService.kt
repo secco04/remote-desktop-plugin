@@ -152,6 +152,8 @@ class RemoteDesktopSessionService : Service() {
                     port = resolvedPort,
                     username = username,
                     password = password,
+                    initialWidth = width,
+                    initialHeight = height,
                     onProgress = { line -> runCatching { callback?.onProgress(line) } },
                     onConnected = { w, h ->
                         runCatching { callback?.onConnected() }
@@ -211,6 +213,15 @@ class RemoteDesktopSessionService : Service() {
                 rdpClient?.sendPointerEvent(x, y, buttonMask)
             } catch (e: Exception) {
                 Log.w(TAG, "sendPointerEvent handling failed", e)
+            }
+        }
+
+        override fun setZoom(scale: Float, panX: Float, panY: Float) {
+            try {
+                vncClient?.setZoom(scale, panX, panY)
+                rdpClient?.setZoom(scale, panX, panY)
+            } catch (e: Exception) {
+                Log.w(TAG, "setZoom handling failed", e)
             }
         }
 

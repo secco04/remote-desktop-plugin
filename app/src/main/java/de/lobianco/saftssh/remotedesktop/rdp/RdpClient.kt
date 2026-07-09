@@ -12,10 +12,24 @@ import com.freerdp.freerdpcore.services.LibFreeRDP
 private const val TAG = "RdpClient"
 
 // RDP pointer-event flags (MS-RDPBCGR TS_POINTER_FLAG constants — stable protocol spec values,
-// not implementation details).
+// verified against include/freerdp/input.h rather than assumed, since RDP's BUTTON1/2/3 numbering
+// does NOT follow the same left/middle/right order as VNC's buttonMask bit order below).
 private const val PTR_FLAGS_MOVE = 0x0800
 private const val PTR_FLAGS_DOWN = 0x8000
 private const val PTR_FLAGS_BUTTON1 = 0x1000 // left
+private const val PTR_FLAGS_BUTTON2 = 0x2000 // right
+private const val PTR_FLAGS_BUTTON3 = 0x4000 // middle
+
+/** Maps a VNC-convention buttonMask (bit0=left, bit1=middle, bit2=right — see
+ *  IRemoteDesktopSession.sendPointerEvent's doc) to the one RDP button flag it represents. Our
+ *  touch UI only ever sets one bit at a time (single-finger vs. two-finger-tap are mutually
+ *  exclusive gestures), so "one bit -> one flag" is all that's needed; 0 = no button. */
+private fun rdpButtonFlag(vncButtonMask: Int): Int = when {
+    vncButtonMask and 0x01 != 0 -> PTR_FLAGS_BUTTON1
+    vncButtonMask and 0x04 != 0 -> PTR_FLAGS_BUTTON2
+    vncButtonMask and 0x02 != 0 -> PTR_FLAGS_BUTTON3
+    else -> 0
+}
 
 /**
  * Thin wrapper around the vendored [LibFreeRDP] JNI bridge (FreeRDP's own upstream Android
@@ -41,6 +55,11 @@ class RdpClient(
     private val port: Int,
     private val username: String?,
     private val password: String?,
+    /** The hosting Surface's actual size at connect time, used as the requested RDP session
+     *  resolution (see the /size query param below) so the remote desktop fills the visible
+     *  viewport instead of a fixed default — 0 falls back to a sane default. */
+    private val initialWidth: Int,
+    private val initialHeight: Int,
     private val onProgress: (String) -> Unit,
     private val onConnected: (width: Int, height: Int) -> Unit,
     private val onDisconnected: (reason: String) -> Unit,
@@ -53,15 +72,26 @@ class RdpClient(
 
     @Volatile var targetSurface: Surface? = null
 
-    // Letterbox render geometry (see VncClient for the same reasoning) — used to inverse-map
-    // Surface-pixel touch coordinates back to remote-desktop pixels in sendPointerEvent.
+    // Letterbox * zoom render geometry (see VncClient for the same reasoning) — used to
+    // inverse-map Surface-pixel touch coordinates back to remote-desktop pixels in
+    // sendPointerEvent. zoomScale/panX/panY are set by RemoteDesktopScreen via setZoom().
     @Volatile private var renderScale = 1f
     @Volatile private var renderOffsetX = 0f
     @Volatile private var renderOffsetY = 0f
-    // Tracks whether the left button was down on the previous pointer event, so a press→release
-    // transition can emit an explicit RDP button-up (PTR_FLAGS_BUTTON1 without PTR_FLAGS_DOWN) —
-    // RDP has no "no buttons" release, the button flag must be repeated on the up event.
-    @Volatile private var lastButtonDown = false
+    @Volatile private var zoomScale = 1f
+    @Volatile private var panX = 0f
+    @Volatile private var panY = 0f
+    // Tracks which single RDP button flag (if any) was down on the previous pointer event, so a
+    // press→release transition can emit an explicit RDP button-up (the same PTR_FLAGS_BUTTONn
+    // without PTR_FLAGS_DOWN) — RDP has no "no buttons" release, the button flag must be
+    // repeated on the up event.
+    @Volatile private var lastButtonFlag = 0
+
+    fun setZoom(scale: Float, newPanX: Float, newPanY: Float) {
+        zoomScale = scale.coerceAtLeast(0.1f)
+        panX = newPanX
+        panY = newPanY
+    }
 
     /** Throws if the connection parameters are rejected before the connect thread even starts
      *  (e.g. a malformed URI) — the caller (RemoteDesktopSessionService.buildSession) must let
@@ -152,10 +182,11 @@ class RdpClient(
         // returned false and the connect thread never started). There's no CLI flag needed to
         // "enable" Unicode keyboard input in this version — sendUnicodeKeyEvent() works
         // independently of the negotiated keyboard layout, which only matters for scancodes.
+        val sizeParam = if (initialWidth > 0 && initialHeight > 0) "${initialWidth}x$initialHeight" else "1280x800"
         val uriBuilder = Uri.Builder()
             .scheme("freerdp")
             .encodedAuthority(buildAuthority())
-            .appendQueryParameter("size", "1280x800") // renegotiated via OnGraphicsResize anyway
+            .appendQueryParameter("size", sizeParam)
             .appendQueryParameter("bpp", "32")
             .appendQueryParameter("clipboard", "")
             .appendQueryParameter("sec", "nla") // most modern Windows hosts require NLA by default
@@ -222,17 +253,19 @@ class RdpClient(
 
     fun isAlive(): Boolean = connected
 
+    /** [buttonMask] follows the VNC convention (bit0=left, bit1=middle, bit2=right) — see
+     *  [rdpButtonFlag] for the (non-trivial) mapping onto RDP's own BUTTON1/2/3 numbering. */
     fun sendPointerEvent(x: Int, y: Int, buttonMask: Int) {
         val bmp = bitmap
         val mx = if (bmp != null) ((x - renderOffsetX) / renderScale).toInt().coerceIn(0, bmp.width - 1) else x
         val my = if (bmp != null) ((y - renderOffsetY) / renderScale).toInt().coerceIn(0, bmp.height - 1) else y
-        val down = buttonMask and 1 != 0
+        val currentFlag = rdpButtonFlag(buttonMask)
         val flags = when {
-            down -> PTR_FLAGS_MOVE or PTR_FLAGS_DOWN or PTR_FLAGS_BUTTON1 // press or drag
-            lastButtonDown -> PTR_FLAGS_BUTTON1 // release (button flag without DOWN = button-up)
+            currentFlag != 0 -> PTR_FLAGS_MOVE or PTR_FLAGS_DOWN or currentFlag // press or drag
+            lastButtonFlag != 0 -> lastButtonFlag // release (flag without DOWN = button-up)
             else -> PTR_FLAGS_MOVE // hover / move with no button
         }
-        lastButtonDown = down
+        lastButtonFlag = currentFlag
         runCatching { LibFreeRDP.sendCursorEvent(inst, mx, my, flags) }
     }
 
@@ -251,14 +284,15 @@ class RdpClient(
         try {
             val canvas = surface.lockCanvas(null) ?: return
             try {
-                // Letterbox to preserve aspect ratio — same approach as VncClient.blitToSurface.
+                // Letterbox * zoom — see VncClient.blitToSurface for the identical reasoning.
                 val sw = canvas.width
                 val sh = canvas.height
-                val scale = minOf(sw.toFloat() / bmp.width, sh.toFloat() / bmp.height)
+                val baseScale = minOf(sw.toFloat() / bmp.width, sh.toFloat() / bmp.height)
+                val scale = baseScale * zoomScale
                 val dw = bmp.width * scale
                 val dh = bmp.height * scale
-                val ox = (sw - dw) / 2f
-                val oy = (sh - dh) / 2f
+                val ox = (sw - dw) / 2f + panX
+                val oy = (sh - dh) / 2f + panY
                 renderScale = scale
                 renderOffsetX = ox
                 renderOffsetY = oy
