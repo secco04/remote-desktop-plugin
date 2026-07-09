@@ -1,0 +1,3 @@
+[submodule "remote-desktop-clients"]
+	path = remote-desktop-clients
+	url = https://github.com/secco04/remote-desktop-clients.git
