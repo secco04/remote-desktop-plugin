@@ -188,6 +188,11 @@ class RemoteDesktopSessionService : Service() {
     private inner class SessionImpl : IRemoteDesktopSession.Stub() {
         var vncClient: VncClient? = null
         var rdpClient: RdpClient? = null
+        // Diagnostic: log only the first pointer/key event that reaches the plugin, so we can
+        // confirm input actually crosses the Binder and reaches a client without spamming the log
+        // on every touch move.
+        @Volatile private var loggedFirstPointer = false
+        @Volatile private var loggedFirstKey = false
 
         override fun resize(width: Int, height: Int) {
             // Neither backend supports live mid-session resize yet — VNC's RFB profile here has
@@ -197,13 +202,29 @@ class RemoteDesktopSessionService : Service() {
         }
 
         override fun sendPointerEvent(x: Int, y: Int, buttonMask: Int) {
-            vncClient?.sendPointerEvent(x, y, buttonMask)
-            rdpClient?.sendPointerEvent(x, y, buttonMask)
+            if (!loggedFirstPointer) {
+                loggedFirstPointer = true
+                Log.i(TAG, "First pointer event reached plugin: ($x,$y) mask=$buttonMask vnc=${vncClient != null} rdp=${rdpClient != null}")
+            }
+            try {
+                vncClient?.sendPointerEvent(x, y, buttonMask)
+                rdpClient?.sendPointerEvent(x, y, buttonMask)
+            } catch (e: Exception) {
+                Log.w(TAG, "sendPointerEvent handling failed", e)
+            }
         }
 
         override fun sendKeyEvent(keyCode: Int, unicodeChar: Int, down: Boolean, metaState: Int) {
-            vncClient?.let { it.sendKeyEvent(AndroidKeysym.map(keyCode, unicodeChar), down) }
-            rdpClient?.sendKeyEvent(keyCode, unicodeChar, down)
+            if (!loggedFirstKey) {
+                loggedFirstKey = true
+                Log.i(TAG, "First key event reached plugin: keyCode=$keyCode unicode=$unicodeChar down=$down")
+            }
+            try {
+                vncClient?.let { it.sendKeyEvent(AndroidKeysym.map(keyCode, unicodeChar), down) }
+                rdpClient?.sendKeyEvent(keyCode, unicodeChar, down)
+            } catch (e: Exception) {
+                Log.w(TAG, "sendKeyEvent handling failed", e)
+            }
         }
 
         override fun isAlive(): Boolean = vncClient?.isAlive() ?: rdpClient?.isAlive() ?: false

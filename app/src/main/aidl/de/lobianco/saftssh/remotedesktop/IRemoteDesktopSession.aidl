@@ -14,17 +14,21 @@ interface IRemoteDesktopSession {
     void resize(int width, int height);
 
     /**
-     * Forwards a pointer/touch event. x/y are in REMOTE framebuffer coordinates (the main app is
-     * responsible for translating its own view-local touch coordinates first, since only it
-     * knows the current scale/pan). buttonMask bit 0 = primary/left button/tap down.
+     * Forwards a pointer/touch event. x/y are Surface-local pixels (the plugin maps them to
+     * framebuffer coordinates via its current letterbox geometry). buttonMask bit 0 =
+     * primary/left button/tap down.
+     *
+     * oneway: high-frequency input must not block the caller's UI thread on a synchronous Binder
+     * round-trip per touch move, and there's no return value to wait for — fire-and-forget.
      */
-    void sendPointerEvent(int x, int y, int buttonMask);
+    oneway void sendPointerEvent(int x, int y, int buttonMask);
 
     /** Forwards a key event. keyCode/metaState follow android.view.KeyEvent's constants;
      *  unicodeChar is KeyEvent.getUnicodeChar()'s result (0 if none) — already accounts for the
      *  current shift/caps-lock state, which the plugin needs for correct printable-character
-     *  mapping without reimplementing Android's own keymap logic. */
-    void sendKeyEvent(int keyCode, int unicodeChar, boolean down, int metaState);
+     *  mapping without reimplementing Android's own keymap logic.
+     *  oneway for the same reason as sendPointerEvent. */
+    oneway void sendKeyEvent(int keyCode, int unicodeChar, boolean down, int metaState);
 
     /** True if the underlying connection is still alive. */
     boolean isAlive();
