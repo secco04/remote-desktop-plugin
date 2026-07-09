@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Needed to keep a session alive while both apps are backgrounded — same reasoning as the
+         Linux Plugin's LinuxSessionService.startForeground. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+        protectionLevel="dangerous" — requested at runtime by the main app, not granted at
+        install time. Learned the hard way on the Linux Plugin: a "normal" custom permission is
+        only granted to the requesting app at THAT app's own install/update time, checked
+        against whatever permissions already exist on the device then. Since almost every real
+        user installs the main LobiShell app long before this plugin, a "normal" grant would
+        silently and permanently fail for virtually everyone.
+    -->
+    <permission
+        android:name="de.lobianco.saftssh.remotedesktop.READ_BINARY"
+        android:protectionLevel="dangerous"
+        android:label="Access LobiShell Remote Desktop Plugin" />
+
+    <application
+        android:label="LobiShell Remote Desktop Plugin"
+        android:allowBackup="false"
+        android:supportsRtl="true"
+        android:icon="@mipmap/ic_launcher">
+
+        <activity
+            android:name=".InfoActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".RemoteDesktopSessionService"
+            android:exported="true"
+            android:permission="de.lobianco.saftssh.remotedesktop.READ_BINARY"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps a user-started remote desktop session (VNC/RDP/SPICE) alive while backgrounded" />
+            <intent-filter>
+                <action android:name="de.lobianco.saftssh.remotedesktop.BIND_SESSION_SERVICE" />
+            </intent-filter>
+        </service>
+
+    </application>
+
+</manifest>

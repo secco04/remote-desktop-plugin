@@ -62,4 +62,31 @@ history for why).
 
 ## Status
 
-Scaffolding only — AIDL contract and app module not yet designed/implemented.
+- `app/` module skeleton: `build.gradle.kts`, `AndroidManifest.xml` (dangerous permission +
+  bound service declaration), launcher `InfoActivity`. Builds standalone.
+- AIDL contract designed and written (both here and mirrored in the main app repo):
+  `IRemoteDesktopSessionService.createSession(protocol, host, port, user, pass, surface, w, h,
+  callback)` → `IRemoteDesktopSession` (resize/sendPointerEvent/sendKeyEvent/destroy). The
+  `android.view.Surface` is drawn onto directly by the plugin process — no per-frame pixel data
+  crosses the Binder call.
+- `RemoteDesktopSessionService.kt` — service/session scaffolding in place, but
+  **`buildSession()` throws `UnsupportedOperationException`** — the actual vendored-library
+  integration isn't wired yet. See the TODOs in that file for the concrete plan (host a
+  `RemoteCanvas` offscreen, blit its `Bitmap` onto the `Surface` on every `reDraw()`, dispatch
+  pointer/key events into its existing input handling).
+
+### Wiring the vendored library — needs Android Studio
+
+`remote-desktop-clients/bVNC` and `remote-desktop-clients/remoteClientLib` are proper
+`com.android.library` modules, but on **Groovy DSL + AGP 8.13.2**, while this project's own
+`app/` module is **Kotlin DSL + AGP 9.2.1**. This mismatch needs to be resolved with a real
+Gradle sync (not verifiable without one — same constraint as the Linux Plugin's native builds).
+Two approaches to try, in `settings.gradle.kts`:
+
+1. `includeBuild("remote-desktop-clients")` (composite build) + `dependencySubstitution` rules.
+2. `include(":bvnc-lib")` + `project(":bvnc-lib").projectDir = file("remote-desktop-clients/bVNC")`
+   (and the same for `remoteClientLib`) — simpler, but check whether the modules' own AGP-8-era
+   config survives being built under AGP 9 unmodified.
+
+Once resolved, `app/build.gradle.kts`'s `dependencies {}` block has the exact `implementation(...)`
+lines to uncomment.
