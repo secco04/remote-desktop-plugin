@@ -6,6 +6,8 @@ import android.os.Binder
 import android.os.IBinder
 import android.util.Log
 import android.view.Surface
+import de.lobianco.saftssh.remotedesktop.rdp.RdpCertStore
+import de.lobianco.saftssh.remotedesktop.rdp.RdpClient
 import de.lobianco.saftssh.remotedesktop.vnc.AndroidKeysym
 import de.lobianco.saftssh.remotedesktop.vnc.VncClient
 
@@ -36,10 +38,12 @@ private val ALLOWED_CALLER_PACKAGES = setOf("de.lobianco.saftssh")
  * but silently doesn't work. RFB itself is small and well-specified (RFC 6143), so a minimal
  * from-scratch client was the more honest path to something that actually connects and renders.
  *
- * RDP/SPICE are NOT implemented — both need native runtimes (FreeRDP / spice-gtk) that require a
- * real NDK cross-compile toolchain to build, which can't be set up or verified without an actual
- * Android Studio session (same class of constraint as the Linux Plugin's proot native libs).
- * [buildSession] fails those with a clear, honest error rather than pretending to connect.
+ * RDP is backed by [RdpClient], a thin wrapper around FreeRDP's own vendored upstream JNI bridge
+ * (com.freerdp.freerdpcore.services.LibFreeRDP) — see that file's doc for why its native
+ * libraries are prebuilt binaries rather than built from source here.
+ *
+ * SPICE is NOT implemented — it needs spice-gtk, a native runtime this plugin doesn't bundle.
+ * [buildSession] fails it with a clear, honest error rather than pretending to connect.
  *
  * Session lifecycle mirrors the Linux Plugin's LinuxSessionService: a foreground service while
  * any session is open, each session owns its own resources and is torn down independently.
@@ -102,6 +106,13 @@ class RemoteDesktopSessionService : Service() {
                 null
             }
         }
+
+        override fun trustRdpCertificate(host: String?, port: Int, fingerprint: String?) {
+            if (!isCallerAuthorized()) return
+            if (host == null || fingerprint == null) return
+            RdpCertStore(this@RemoteDesktopSessionService).trust(host, port, fingerprint)
+            Log.i(TAG, "Trusted RDP certificate for $host:$port")
+        }
     }
 
     // ── Session construction ──────────────────────────────────────────────
@@ -111,55 +122,82 @@ class RemoteDesktopSessionService : Service() {
         surface: Surface, width: Int, height: Int,
         callback: IRemoteDesktopSessionCallback?,
     ): SessionImpl {
-        if (protocol != "vnc") {
-            throw UnsupportedOperationException(
+        val session = SessionImpl()
+        when (protocol) {
+            "vnc" -> {
+                val resolvedPort = if (port > 0) port else 5900
+                val client = VncClient(
+                    host = host,
+                    port = resolvedPort,
+                    password = password,
+                    onProgress = { line -> runCatching { callback?.onProgress(line) } },
+                    onConnected = { w, h ->
+                        runCatching { callback?.onConnected() }
+                        Log.i(TAG, "VNC connected: ${w}x$h")
+                    },
+                    onDisconnected = { reason ->
+                        runCatching { callback?.onDisconnected(reason) }
+                        session.destroyInternal()
+                    },
+                )
+                client.targetSurface = surface
+                session.vncClient = client
+                client.start()
+            }
+            "rdp" -> {
+                val resolvedPort = if (port > 0) port else 3389
+                val client = RdpClient(
+                    context = this,
+                    host = host,
+                    port = resolvedPort,
+                    username = username,
+                    password = password,
+                    onProgress = { line -> runCatching { callback?.onProgress(line) } },
+                    onConnected = { w, h ->
+                        runCatching { callback?.onConnected() }
+                        Log.i(TAG, "RDP connected: ${w}x$h")
+                    },
+                    onDisconnected = { reason ->
+                        runCatching { callback?.onDisconnected(reason) }
+                        session.destroyInternal()
+                    },
+                )
+                client.targetSurface = surface
+                session.rdpClient = client
+                client.start()
+            }
+            else -> throw UnsupportedOperationException(
                 "${protocol.uppercase()} isn't available in this build — it needs a native " +
-                    "runtime (FreeRDP/spice-gtk) this plugin doesn't currently bundle. VNC works."
+                    "runtime (spice-gtk) this plugin doesn't currently bundle. VNC and RDP work."
             )
         }
-        val resolvedPort = if (port > 0) port else 5900
-        val session = SessionImpl()
-        val client = VncClient(
-            host = host,
-            port = resolvedPort,
-            password = password,
-            onProgress = { line -> runCatching { callback?.onProgress(line) } },
-            onConnected = { w, h ->
-                runCatching { callback?.onConnected() }
-                Log.i(TAG, "VNC connected: ${w}x$h")
-            },
-            onDisconnected = { reason ->
-                runCatching { callback?.onDisconnected(reason) }
-                session.destroyInternal()
-            },
-        )
-        client.targetSurface = surface
-        session.client = client
-        client.start()
         return session
     }
 
     // ── Session implementation ────────────────────────────────────────────
 
     private inner class SessionImpl : IRemoteDesktopSession.Stub() {
-        var client: VncClient? = null
+        var vncClient: VncClient? = null
+        var rdpClient: RdpClient? = null
 
         override fun resize(width: Int, height: Int) {
-            // The VNC framebuffer size is fixed for the connection's lifetime (RFB has no live
-            // resize in the profile we implement) — blitToSurface() already scales to whatever
-            // size the Surface currently is, so a resize just needs the next frame to notice.
+            // Neither backend supports live mid-session resize yet — VNC's RFB profile here has
+            // none, and RDP's negotiated resolution comes from OnGraphicsResize instead. Both
+            // blitToSurface() implementations already scale to whatever size the Surface
+            // currently is, so a caller-side resize just needs the next frame to notice.
         }
 
         override fun sendPointerEvent(x: Int, y: Int, buttonMask: Int) {
-            client?.sendPointerEvent(x, y, buttonMask)
+            vncClient?.sendPointerEvent(x, y, buttonMask)
+            rdpClient?.sendPointerEvent(x, y, buttonMask)
         }
 
         override fun sendKeyEvent(keyCode: Int, unicodeChar: Int, down: Boolean, metaState: Int) {
-            val keysym = AndroidKeysym.map(keyCode, unicodeChar)
-            client?.sendKeyEvent(keysym, down)
+            vncClient?.let { it.sendKeyEvent(AndroidKeysym.map(keyCode, unicodeChar), down) }
+            rdpClient?.sendKeyEvent(keyCode, unicodeChar, down)
         }
 
-        override fun isAlive(): Boolean = client?.isAlive() ?: false
+        override fun isAlive(): Boolean = vncClient?.isAlive() ?: rdpClient?.isAlive() ?: false
 
         override fun destroy() {
             destroyInternal()
@@ -168,7 +206,8 @@ class RemoteDesktopSessionService : Service() {
         fun destroyInternal() {
             openSessions.remove(this)
             demoteFromForegroundIfIdle()
-            runCatching { client?.stop() }
+            runCatching { vncClient?.stop() }
+            runCatching { rdpClient?.stop() }
         }
     }
 }

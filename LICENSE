@@ -18,24 +18,41 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 This project vendors, as a git submodule (remote-desktop-clients/), a fork
 (https://github.com/secco04/remote-desktop-clients) of Iordan Iordanov's
 "remote-desktop-clients" repo (https://github.com/iiordanov/bVNC -- bVNC/aRDP/
-aSPICE/Opaque), which provides Android VNC, RDP, and SPICE remote-desktop
-clients (plus Proxmox/oVirt VM discovery). That project is licensed GPL-3.0,
-with a handful of individual files under other compatible licenses (MPL for
-one FreeRDP-derived file, LGPL for spice-gtk-derived code) -- see its own
-COPYRIGHT-bVNC / LICENSE files for the exact per-file breakdown. It also
-bundles further third-party native components (FreeRDP, spice-gtk, and their
-own dependencies), each under their own upstream licenses -- not restated
-here; see remote-desktop-clients/jni/ and that project's own documentation.
+aSPICE/Opaque), licensed GPL-3.0. Kept for reference and as a possible future
+base for SPICE support; NOT the basis for this plugin's VNC or RDP support
+(see below) -- see the submodule's own COPYRIGHT-bVNC / LICENSE files if you
+need its per-file license breakdown. Kept in sync via GitHub's "Sync fork"
+feature (https://github.com/secco04/remote-desktop-clients -> Sync fork)
+rather than by patching the vendored source directly.
 
-Bundling this GPL-3.0 codebase is why this whole project is GPL-3.0-licensed
-and kept in its own repository, separate from the commercial main LobiShell
-app -- same reasoning as the LobiShell Linux Plugin's GPL-2.0 proot bundling.
+Bundling GPL-3.0 code (see below) is why this whole project is GPL-3.0-
+licensed and kept in its own repository, separate from the commercial main
+LobiShell app -- same reasoning as the LobiShell Linux Plugin's GPL-2.0 proot
+bundling.
 
-The submodule is an unmodified fork of upstream, kept in sync via GitHub's
-"Sync fork" feature (https://github.com/secco04/remote-desktop-clients ->
-Sync fork) rather than by patching the vendored source directly -- any
-LobiShell-specific integration code lives in this repo's own app/ module,
-not inside the submodule.
+VNC support (app/src/main/java/de/lobianco/saftssh/remotedesktop/vnc/) is a
+from-scratch implementation of the RFB protocol (RFC 6143) written for this
+project -- not derived from bVNC or any other GPL codebase.
+
+RDP support vendors FreeRDP's own official upstream Android JNI bridge,
+LibFreeRDP.java (https://github.com/FreeRDP/FreeRDP/blob/master/client/
+Android/Studio/freeRDPCore/src/main/java/com/freerdp/freerdpcore/services/
+LibFreeRDP.java), licensed MPL-2.0, with LobiShell-specific modifications
+documented in that file's own header (MPL-2.0 and this project's GPL-3.0 may
+be combined per MPL 2.0 section 3.3). The native libraries it calls into
+(libfreerdp-android.so, libfreerdp-client2.so, libfreerdp2.so, libwinpr2.so,
+libssl.so, libcrypto.so, libavcodec.so, libavutil.so, libswresample.so,
+libswscale.so, libc++_shared.so) are prebuilt binaries extracted from
+iiordanov/remote-desktop-clients' official "freeaRDP" GitHub Release APK
+(v6.4.5, https://github.com/iiordanov/remote-desktop-clients/releases) --
+building FreeRDP and its dependencies (OpenSSL, ffmpeg) from source needs a
+multi-hour native cross-compile toolchain (Cerbero) not set up for this
+project. FreeRDP itself is licensed Apache-2.0 (confirmed from its own
+upstream LICENSE file); OpenSSL is Apache-2.0; ffmpeg's license depends on
+its build configuration and is not independently re-verified here -- see
+https://github.com/iiordanov/remote-desktop-clients for how that specific
+build was produced. None of these binaries were modified from the release
+build before being bundled here.
 
 ----
 
