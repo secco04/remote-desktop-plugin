@@ -33,6 +33,13 @@ interface IRemoteDesktopSession {
      */
     oneway void setZoom(float scale, float panX, float panY);
 
+    /**
+     * Sends mouse-wheel scroll notches at the current pointer position. [steps] > 0 scrolls up
+     * (away from the user), < 0 scrolls down; the magnitude is the number of notches. oneway for
+     * the same reason as sendPointerEvent.
+     */
+    oneway void sendScroll(int steps);
+
     /** Forwards a key event. keyCode/metaState follow android.view.KeyEvent's constants;
      *  unicodeChar is KeyEvent.getUnicodeChar()'s result (0 if none) — already accounts for the
      *  current shift/caps-lock state, which the plugin needs for correct printable-character

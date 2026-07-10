@@ -140,6 +140,27 @@ class VncClient(
         blitToSurface()
     }
 
+    /** Mouse wheel via RFB PointerEvent button bits (RFC 6143: bit 3 = wheel up, bit 4 = wheel
+     *  down). Each notch is a press+release of the wheel "button" at the current pointer position.
+     *  [steps] > 0 = up, < 0 = down; magnitude = notch count. */
+    fun sendScroll(steps: Int) {
+        val out = output ?: return
+        if (steps == 0) return
+        val bit = if (steps > 0) 0x08 else 0x10
+        val count = if (steps > 0) steps else -steps
+        try {
+            synchronized(out) {
+                repeat(count) {
+                    out.writeByte(5); out.writeByte(bit); out.writeShort(pointerFbX); out.writeShort(pointerFbY)
+                    out.writeByte(5); out.writeByte(0); out.writeShort(pointerFbX); out.writeShort(pointerFbY)
+                }
+                out.flush()
+            }
+        } catch (e: IOException) {
+            Log.w(TAG, "sendScroll failed: ${e.message}")
+        }
+    }
+
     /** RFB KeyEvent (message type 4). [keysym] is an X11 keysym, not an Android keyCode — see
      *  [AndroidKeysym.map]. */
     fun sendKeyEvent(keysym: Int, down: Boolean) {

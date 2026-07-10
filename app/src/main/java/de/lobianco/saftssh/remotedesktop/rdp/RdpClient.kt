@@ -21,6 +21,11 @@ private const val PTR_FLAGS_DOWN = 0x8000
 private const val PTR_FLAGS_BUTTON1 = 0x1000 // left
 private const val PTR_FLAGS_BUTTON2 = 0x2000 // right
 private const val PTR_FLAGS_BUTTON3 = 0x4000 // middle
+private const val PTR_FLAGS_WHEEL = 0x0200
+// Wheel flags for one notch, taken verbatim from FreeRDP 2.11.7's reference Mouse.getScrollEvent
+// (up = WHEEL | 0x0078, down = WHEEL | WHEEL_NEGATIVE(0x0100) | 0x0088).
+private const val WHEEL_UP = PTR_FLAGS_WHEEL or 0x0078
+private const val WHEEL_DOWN = PTR_FLAGS_WHEEL or 0x0100 or 0x0088
 
 /** Maps a VNC-convention buttonMask (bit0=left, bit1=middle, bit2=right — see
  *  IRemoteDesktopSession.sendPointerEvent's doc) to the one RDP button flag it represents. Our
@@ -292,6 +297,16 @@ class RdpClient(
     @Volatile private var ctrlHeld = false
     @Volatile private var altHeld = false
     @Volatile private var winHeld = false
+
+    /** Mouse wheel. [steps] > 0 = up, < 0 = down; magnitude = notch count. Sent at the current
+     *  pointer position (FreeRDP applies the wheel wherever the cursor currently is). */
+    fun sendScroll(steps: Int) {
+        if (steps == 0) return
+        val flags = if (steps > 0) WHEEL_UP else WHEEL_DOWN
+        repeat(if (steps > 0) steps else -steps) {
+            runCatching { LibFreeRDP.sendCursorEvent(inst, pointerFbX, pointerFbY, flags) }
+        }
+    }
 
     fun sendKeyEvent(keyCode: Int, unicodeChar: Int, down: Boolean) {
         when (keyCode) {

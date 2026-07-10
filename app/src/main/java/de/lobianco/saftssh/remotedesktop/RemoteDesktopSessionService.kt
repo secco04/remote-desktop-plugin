@@ -225,6 +225,15 @@ class RemoteDesktopSessionService : Service() {
             }
         }
 
+        override fun sendScroll(steps: Int) {
+            try {
+                vncClient?.sendScroll(steps)
+                rdpClient?.sendScroll(steps)
+            } catch (e: Exception) {
+                Log.w(TAG, "sendScroll handling failed", e)
+            }
+        }
+
         override fun sendKeyEvent(keyCode: Int, unicodeChar: Int, down: Boolean, metaState: Int) {
             if (!loggedFirstKey) {
                 loggedFirstKey = true
