@@ -8,6 +8,7 @@ import android.net.Uri
 import android.util.Log
 import android.view.Surface
 import com.freerdp.freerdpcore.services.LibFreeRDP
+import de.lobianco.saftssh.remotedesktop.SyntheticCursor
 
 private const val TAG = "RdpClient"
 
@@ -86,11 +87,18 @@ class RdpClient(
     // without PTR_FLAGS_DOWN) — RDP has no "no buttons" release, the button flag must be
     // repeated on the up event.
     @Volatile private var lastButtonFlag = 0
+    // Last pointer position we sent, in framebuffer pixels — where SyntheticCursor is drawn.
+    @Volatile private var pointerFbX = 0
+    @Volatile private var pointerFbY = 0
+    // Serialises lockCanvas/unlock between the FreeRDP graphics-update thread and Binder threads
+    // calling in on a pointer move (see VncClient for the same reasoning).
+    private val renderLock = Any()
 
     fun setZoom(scale: Float, newPanX: Float, newPanY: Float) {
         zoomScale = scale.coerceAtLeast(0.1f)
         panX = newPanX
         panY = newPanY
+        blitToSurface() // reflect the new zoom immediately, even without a fresh server frame
     }
 
     /** Throws if the connection parameters are rejected before the connect thread even starts
@@ -113,6 +121,8 @@ class RdpClient(
                 // source + the reference SessionActivity, not guessed.
                 Log.i(TAG, "OnSettingsChanged: ${width}x$height @${bpp}bpp")
                 allocateFramebuffer(width, height)
+                pointerFbX = width / 2
+                pointerFbY = height / 2
                 if (!connected) {
                     connected = true
                     onProgress("Connected — ${width}x$height")
@@ -259,6 +269,8 @@ class RdpClient(
         val bmp = bitmap
         val mx = if (bmp != null) ((x - renderOffsetX) / renderScale).toInt().coerceIn(0, bmp.width - 1) else x
         val my = if (bmp != null) ((y - renderOffsetY) / renderScale).toInt().coerceIn(0, bmp.height - 1) else y
+        pointerFbX = mx
+        pointerFbY = my
         val currentFlag = rdpButtonFlag(buttonMask)
         val flags = when {
             currentFlag != 0 -> PTR_FLAGS_MOVE or PTR_FLAGS_DOWN or currentFlag // press or drag
@@ -267,6 +279,8 @@ class RdpClient(
         }
         lastButtonFlag = currentFlag
         runCatching { LibFreeRDP.sendCursorEvent(inst, mx, my, flags) }
+        // Redraw so the synthetic cursor tracks the pointer between server frames.
+        blitToSurface()
     }
 
     fun sendKeyEvent(keyCode: Int, unicodeChar: Int, down: Boolean) {
@@ -281,28 +295,30 @@ class RdpClient(
         val bmp = bitmap ?: return
         val surface = targetSurface ?: return
         if (!surface.isValid) return
-        try {
-            val canvas = surface.lockCanvas(null) ?: return
+        synchronized(renderLock) {
             try {
-                // Letterbox * zoom — see VncClient.blitToSurface for the identical reasoning.
-                val sw = canvas.width
-                val sh = canvas.height
-                val baseScale = minOf(sw.toFloat() / bmp.width, sh.toFloat() / bmp.height)
-                val scale = baseScale * zoomScale
-                val dw = bmp.width * scale
-                val dh = bmp.height * scale
-                val ox = (sw - dw) / 2f + panX
-                val oy = (sh - dh) / 2f + panY
-                renderScale = scale
-                renderOffsetX = ox
-                renderOffsetY = oy
-                canvas.drawColor(Color.BLACK)
-                canvas.drawBitmap(bmp, null, RectF(ox, oy, ox + dw, oy + dh), null)
-            } finally {
-                surface.unlockCanvasAndPost(canvas)
+                val canvas = surface.lockCanvas(null) ?: return
+                try {
+                    // Letterbox * zoom — see VncClient.blitToSurface for the identical reasoning.
+                    val sw = canvas.width
+                    val sh = canvas.height
+                    val scale = minOf(sw.toFloat() / bmp.width, sh.toFloat() / bmp.height) * zoomScale
+                    val dw = bmp.width * scale
+                    val dh = bmp.height * scale
+                    val ox = (sw - dw) / 2f + panX
+                    val oy = (sh - dh) / 2f + panY
+                    renderScale = scale
+                    renderOffsetX = ox
+                    renderOffsetY = oy
+                    canvas.drawColor(Color.BLACK)
+                    canvas.drawBitmap(bmp, null, RectF(ox, oy, ox + dw, oy + dh), null)
+                    SyntheticCursor.draw(canvas, ox + pointerFbX * scale, oy + pointerFbY * scale)
+                } finally {
+                    surface.unlockCanvasAndPost(canvas)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "blitToSurface failed: ${e.message}")
             }
-        } catch (e: Exception) {
-            Log.w(TAG, "blitToSurface failed: ${e.message}")
         }
     }
 }

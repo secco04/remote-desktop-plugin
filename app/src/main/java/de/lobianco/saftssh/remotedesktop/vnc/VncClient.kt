@@ -7,6 +7,7 @@ import android.graphics.Rect
 import android.graphics.RectF
 import android.util.Log
 import android.view.Surface
+import de.lobianco.saftssh.remotedesktop.SyntheticCursor
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
@@ -19,13 +20,12 @@ import javax.crypto.spec.SecretKeySpec
 
 private const val TAG = "VncClient"
 
-// RFB pseudo-encodings (RFC 6143 §7.7 / the long-standing "TightVNC extensions" every real server
-// and client supports) — negative encoding numbers signal "no pixel data follows in the usual
-// sense, interpret x/y/w/h and any payload specially."
-private const val ENCODING_COPYRECT = 1
+// RFB encodings (RFC 6143 §7.6/§7.7). Negative numbers are "pseudo-encodings": not pixel data,
+// but a signal about cursor shape / desktop size / etc. Every mainstream server supports these.
 private const val ENCODING_RAW = 0
-private const val ENCODING_CURSOR = -239 // RFC 6143 §7.7.2: cursor shape, drawn locally
-private const val ENCODING_DESKTOP_SIZE = -223 // RFC 6143 §7.7.1: framebuffer resolution changed
+private const val ENCODING_COPYRECT = 1
+private const val ENCODING_CURSOR = -239 // §7.7.2: cursor shape (we consume it but draw our own)
+private const val ENCODING_DESKTOP_SIZE = -223 // §7.7.1: framebuffer resolution changed
 
 /**
  * A from-scratch, minimal RFB/VNC client (RFC 6143) — NOT derived from bVNC's source. bVNC's own
@@ -38,13 +38,14 @@ private const val ENCODING_DESKTOP_SIZE = -223 // RFC 6143 §7.7.1: framebuffer 
  * actually functions.
  *
  * Supports: RFB 3.3–3.8 version negotiation, security types None(1)/VNCAuth(2), Raw(0) and
- * CopyRect(1) encodings, the Cursor(-239) pseudo-encoding (drawn locally — most servers don't
- * bake the pointer into the framebuffer pixels themselves), the DesktopSize(-223) pseudo-encoding
- * (server-initiated resolution change — e.g. many Windows VNC servers switch to a different
- * backing resolution for the lock/login screen, which previously desynced this client's stream
- * parsing and surfaced as an EOFException), pointer/key events. Does NOT support: Tight/Hextile/
- * ZRLE encodings (servers that refuse to offer Raw will fail — most do offer it, but some
- * hardened deployments don't), clipboard sync.
+ * CopyRect(1) encodings, the DesktopSize(-223) pseudo-encoding (server-initiated resolution
+ * change — e.g. many Windows VNC servers switch backing resolution for the lock/login screen,
+ * which previously desynced this client's stream parsing and surfaced as an EOFException). The
+ * pointer is drawn locally via [SyntheticCursor] (the Cursor(-239) pseudo-encoding is requested
+ * and consumed so the server keeps the pointer out of the framebuffer pixels, but its shape is
+ * ignored — a synthetic arrow is always drawn instead, which is reliable across servers and
+ * essential for the trackpad-style input mode). Does NOT support: Tight/Hextile/ZRLE encodings
+ * (servers that refuse to offer Raw will fail — most do offer it), clipboard sync.
  */
 class VncClient(
     private val host: String,
@@ -65,42 +66,37 @@ class VncClient(
     @Volatile private var fbHeight = 0
 
     /** The Surface to blit onto after every processed update batch. Settable after connect (the
-     *  caller may not have a sized Surface yet at construction time) — see
-     *  RemoteDesktopSessionService for why the Surface itself never crosses this class's own
-     *  wire-protocol logic. */
+     *  caller may not have a sized Surface yet at construction time). */
     @Volatile var targetSurface: Surface? = null
 
-    // Render geometry from the most recent blit — the framebuffer is drawn letterboxed (aspect
-    // ratio preserved) into the Surface, so incoming touch coordinates (which are in Surface
-    // pixels) must be inverse-transformed back to framebuffer pixels before being sent as pointer
-    // events. Without this, touches in the letterbox bars / beyond the scaled image clamp to the
-    // edge and the remote cursor barely moves. These are the FINAL combined (base letterbox *
-    // zoom) values applied to the most recent frame — sendPointerEvent only ever needs to invert
-    // this one transform, whatever produced it.
+    // Combined (base letterbox * pinch-zoom) render geometry from the most recent blit — incoming
+    // touch coordinates are Surface pixels and must be inverse-transformed back to framebuffer
+    // pixels before being sent as pointer events, and the synthetic cursor is drawn using it too.
     @Volatile private var renderScale = 1f
     @Volatile private var renderOffsetX = 0f
     @Volatile private var renderOffsetY = 0f
 
-    // Pinch-zoom state set by RemoteDesktopScreen via setZoom(). zoomScale is relative to the
-    // base letterbox fit (1.0 = no extra zoom); panX/panY are Surface-local pixel offsets applied
-    // on top of the letterbox's own centering. See blitToSurface for how these combine.
+    // Pinch-zoom state set by RemoteDesktopScreen via setZoom(): zoomScale relative to the base
+    // letterbox fit (1.0 = none), panX/panY Surface-local pixel offsets. See blitToSurface.
     @Volatile private var zoomScale = 1f
     @Volatile private var panX = 0f
     @Volatile private var panY = 0f
 
-    // Cursor pseudo-encoding state (RFC 6143 §7.7.2): the server-provided cursor image + hotspot,
-    // and the last framebuffer-space position we told the server the pointer was at — that's
-    // where we draw this bitmap locally, since the server doesn't render it into the framebuffer.
-    @Volatile private var cursorBitmap: Bitmap? = null
-    @Volatile private var cursorHotspotX = 0
-    @Volatile private var cursorHotspotY = 0
-    @Volatile private var lastPointerFbX = 0
-    @Volatile private var lastPointerFbY = 0
+    // Last pointer position we sent to the server, in framebuffer pixels — where the synthetic
+    // cursor is drawn. Initialised to the framebuffer centre on connect so a cursor is visible
+    // immediately, before the user touches anything.
+    @Volatile private var pointerFbX = 0
+    @Volatile private var pointerFbY = 0
+
+    // lockCanvas/unlockCanvasAndPost must not be entered from two threads at once (the protocol
+    // thread after a framebuffer update, and a Binder thread on a pointer move) — serialise them.
+    private val renderLock = Any()
 
     fun setZoom(scale: Float, newPanX: Float, newPanY: Float) {
         zoomScale = scale.coerceAtLeast(0.1f)
         panX = newPanX
         panY = newPanY
+        blitToSurface() // reflect the new zoom immediately, even without a fresh server frame
     }
 
     fun start() {
@@ -119,15 +115,15 @@ class VncClient(
 
     // ── Input ──────────────────────────────────────────────────────────────
 
-    /** RFB PointerEvent (message type 5). [x]/[y] are Surface-local pixels (as delivered by the
-     *  hosting SurfaceView's touch listener); they're mapped back through the current letterbox+
-     *  zoom geometry to framebuffer pixels here. [buttonMask] bit 0/1/2 = left/middle/right. */
+    /** RFB PointerEvent (message type 5). [x]/[y] are Surface-local pixels; mapped back through
+     *  the current letterbox+zoom geometry to framebuffer pixels here. [buttonMask]: bit0=left,
+     *  bit1=middle, bit2=right (RFC 6143 convention). */
     fun sendPointerEvent(x: Int, y: Int, buttonMask: Int) {
         val out = output ?: return
         val fbX = ((x - renderOffsetX) / renderScale).toInt().coerceIn(0, fbWidth.coerceAtLeast(1) - 1)
         val fbY = ((y - renderOffsetY) / renderScale).toInt().coerceIn(0, fbHeight.coerceAtLeast(1) - 1)
-        lastPointerFbX = fbX
-        lastPointerFbY = fbY
+        pointerFbX = fbX
+        pointerFbY = fbY
         try {
             synchronized(out) {
                 out.writeByte(5)
@@ -139,10 +135,9 @@ class VncClient(
         } catch (e: IOException) {
             Log.w(TAG, "sendPointerEvent failed: ${e.message}")
         }
-        // The server won't push a fresh frame just because the (locally-drawn) cursor needs to
-        // move — redraw immediately so the cursor tracks the finger smoothly between real
-        // framebuffer updates.
-        if (cursorBitmap != null) blitToSurface()
+        // The server won't push a frame just because our locally-drawn cursor moved — redraw so
+        // the cursor tracks the finger smoothly between real framebuffer updates.
+        blitToSurface()
     }
 
     /** RFB KeyEvent (message type 4). [keysym] is an X11 keysym, not an Android keyCode — see
@@ -180,13 +175,13 @@ class VncClient(
             val (w, h) = serverInit(inp, out)
             fbWidth = w
             fbHeight = h
+            pointerFbX = w / 2
+            pointerFbY = h / 2
             framebuffer = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
 
             onProgress("Connected — ${w}x${h}")
             onConnected(w, h)
 
-            // Main update loop: request, wait for the reply, request again. A real client would
-            // pipeline these; a simple request/reply loop is enough for this first version.
             requestFramebufferUpdate(out, incremental = false)
             sock.soTimeout = 0 // block indefinitely on subsequent reads — the server paces updates
             while (running) {
@@ -197,13 +192,11 @@ class VncClient(
                         blitToSurface()
                         requestFramebufferUpdate(out, incremental = true)
                     }
-                    1 -> { // SetColourMapEntries — not used (we request true-colour), but must be
-                           // drained so the stream doesn't desync.
+                    1 -> { // SetColourMapEntries — not used (we request true-colour), drain it.
                         inp.skipBytes(1)
-                        val firstColour = inp.readUnsignedShort()
+                        inp.readUnsignedShort() // first-colour
                         val numColours = inp.readUnsignedShort()
                         inp.skipBytes(numColours * 6)
-                        Log.d(TAG, "Ignoring SetColourMapEntries (first=$firstColour n=$numColours)")
                     }
                     2 -> { /* Bell — no-op */ }
                     3 -> { // ServerCutText
@@ -228,9 +221,6 @@ class VncClient(
     private fun negotiateVersion(inp: DataInputStream, out: DataOutputStream) {
         val serverVersion = ByteArray(12).also { inp.readFully(it) }
         Log.i(TAG, "Server version: ${String(serverVersion).trim()}")
-        // We speak 3.8's wire format for everything we support; claiming 3.8 gets us the widest
-        // feature set servers will offer (older servers just negotiate down their own security
-        // list regardless of what we claim).
         out.write("RFB 003.008\n".toByteArray())
         out.flush()
     }
@@ -238,7 +228,6 @@ class VncClient(
     private fun negotiateSecurity(inp: DataInputStream, out: DataOutputStream) {
         val numTypes = inp.readUnsignedByte()
         if (numTypes == 0) {
-            // RFB 3.3-style failure reason string.
             val len = inp.readInt()
             val reason = ByteArray(len).also { inp.readFully(it) }
             throw IOException("Server refused connection: ${String(reason)}")
@@ -249,7 +238,7 @@ class VncClient(
         val chosen = when {
             hasVncAuth && !password.isNullOrEmpty() -> 2
             hasNone -> 1
-            hasVncAuth -> 2 // server requires auth even with a blank password attempt
+            hasVncAuth -> 2
             else -> throw IOException("No supported security type offered (server offered: ${types.joinToString()})")
         }
         out.writeByte(chosen)
@@ -264,7 +253,6 @@ class VncClient(
 
         val securityResult = inp.readInt()
         if (securityResult != 0) {
-            // RFB 3.8+ sends a reason string; 3.3/3.4 don't. Best-effort read with a short guard.
             val reason = try {
                 val len = inp.readInt()
                 if (len in 0..4096) String(ByteArray(len).also { inp.readFully(it) }) else "authentication failed"
@@ -274,8 +262,7 @@ class VncClient(
     }
 
     /** VNC's DES challenge-response: the password (up to 8 bytes, zero-padded) is used as a DES
-     *  key, but with each key byte's bits reversed — a long-standing RFB protocol quirk (the
-     *  spec's reference implementation built the key this way and every server since expects it). */
+     *  key with each key byte's bits reversed — a long-standing RFB protocol quirk. */
     private fun desEncryptChallenge(challenge: ByteArray, password: String): ByteArray {
         val pwBytes = ByteArray(8)
         val src = password.toByteArray(Charsets.ISO_8859_1)
@@ -296,45 +283,32 @@ class VncClient(
     }
 
     private fun clientInit(out: DataOutputStream) {
-        out.writeByte(1) // shared-flag: allow other viewers to stay connected too
+        out.writeByte(1) // shared-flag
         out.flush()
     }
 
     private fun serverInit(inp: DataInputStream, out: DataOutputStream): Pair<Int, Int> {
         val width = inp.readUnsignedShort()
         val height = inp.readUnsignedShort()
-        // Server's native PIXEL_FORMAT (16 bytes) — we ignore its contents and immediately
-        // override with our own via SetPixelFormat below, so we don't need to parse it beyond
-        // skipping the bytes.
-        inp.skipBytes(16)
+        inp.skipBytes(16) // server PIXEL_FORMAT — overridden below
         val nameLen = inp.readInt()
         val name = ByteArray(nameLen).also { inp.readFully(it) }
         Log.i(TAG, "ServerInit: ${width}x$height name=${String(name)}")
 
-        // SetPixelFormat (message type 0): request 32-bit true-colour, byte order matching
-        // Bitmap.Config.ARGB_8888's in-memory layout (R,G,B,A per pixel on a little-endian
-        // device) so Raw-encoded rectangles can be copied directly into the Bitmap without a
-        // per-pixel format conversion.
+        // SetPixelFormat: 32-bit true-colour, byte order matching ARGB_8888's in-memory layout so
+        // Raw rectangles copy straight into the Bitmap with no per-pixel conversion.
         out.writeByte(0)
-        out.write(byteArrayOf(0, 0, 0)) // padding
-        out.writeByte(32) // bits-per-pixel
-        out.writeByte(24) // depth
-        out.writeByte(0)  // big-endian-flag = false
-        out.writeByte(1)  // true-colour-flag = true
-        out.writeShort(255) // red-max
-        out.writeShort(255) // green-max
-        out.writeShort(255) // blue-max
-        out.writeByte(0)  // red-shift
-        out.writeByte(8)  // green-shift
-        out.writeByte(16) // blue-shift
-        out.write(byteArrayOf(0, 0, 0)) // padding
+        out.write(byteArrayOf(0, 0, 0))
+        out.writeByte(32); out.writeByte(24); out.writeByte(0); out.writeByte(1)
+        out.writeShort(255); out.writeShort(255); out.writeShort(255)
+        out.writeByte(0); out.writeByte(8); out.writeByte(16)
+        out.write(byteArrayOf(0, 0, 0))
         out.flush()
 
-        // SetEncodings (message type 2): Raw + CopyRect for pixel data, plus the Cursor and
-        // DesktopSize pseudo-encodings — see the class doc for why both matter in practice.
+        // SetEncodings: Raw + CopyRect for pixels, plus Cursor and DesktopSize pseudo-encodings.
         out.writeByte(2)
-        out.writeByte(0) // padding
-        out.writeShort(4) // number-of-encodings
+        out.writeByte(0)
+        out.writeShort(4)
         out.writeInt(ENCODING_COPYRECT)
         out.writeInt(ENCODING_RAW)
         out.writeInt(ENCODING_CURSOR)
@@ -347,10 +321,8 @@ class VncClient(
     private fun requestFramebufferUpdate(out: DataOutputStream, incremental: Boolean) {
         out.writeByte(3)
         out.writeByte(if (incremental) 1 else 0)
-        out.writeShort(0)
-        out.writeShort(0)
-        out.writeShort(fbWidth)
-        out.writeShort(fbHeight)
+        out.writeShort(0); out.writeShort(0)
+        out.writeShort(fbWidth); out.writeShort(fbHeight)
         out.flush()
     }
 
@@ -362,12 +334,10 @@ class VncClient(
             val y = inp.readUnsignedShort()
             val w = inp.readUnsignedShort()
             val h = inp.readUnsignedShort()
-            val encoding = inp.readInt()
-            when (encoding) {
-                ENCODING_RAW -> { // w*h pixels, 4 bytes each, in the SetPixelFormat layout we requested.
+            when (val encoding = inp.readInt()) {
+                ENCODING_RAW -> {
                     val fb = framebuffer ?: return@repeat
-                    val rowBytes = w * 4
-                    val row = ByteArray(rowBytes)
+                    val row = ByteArray(w * 4)
                     val pixels = IntArray(w)
                     for (ry in 0 until h) {
                         inp.readFully(row)
@@ -381,52 +351,31 @@ class VncClient(
                         if (y + ry < fb.height) fb.setPixels(pixels, 0, w, x, y + ry, w.coerceAtMost(fb.width - x), 1)
                     }
                 }
-                ENCODING_COPYRECT -> { // 4 bytes giving the source x/y to copy FROM within our own framebuffer.
+                ENCODING_COPYRECT -> {
                     val fb = framebuffer ?: return@repeat
                     val srcX = inp.readUnsignedShort()
                     val srcY = inp.readUnsignedShort()
-                    val srcRect = Rect(srcX, srcY, srcX + w, srcY + h)
-                    val dstRect = Rect(x, y, x + w, y + h)
-                    val canvas = Canvas(fb)
-                    val copy = Bitmap.createBitmap(fb, srcRect.left, srcRect.top, srcRect.width(), srcRect.height())
-                    canvas.drawBitmap(copy, null, dstRect, null)
+                    val copy = Bitmap.createBitmap(fb, srcX, srcY, w, h)
+                    Canvas(fb).drawBitmap(copy, null, Rect(x, y, x + w, y + h), null)
                     copy.recycle()
                 }
-                ENCODING_CURSOR -> { // RFC 6143 §7.7.2: x,y = hotspot; w,h = cursor size; then
-                    // w*h pixels (same PIXEL_FORMAT as Raw) followed by a 1-bit-per-pixel bitmask
-                    // (ceil(w/8) bytes per row) marking which pixels are opaque.
+                ENCODING_CURSOR -> {
+                    // Consume the cursor shape so the stream stays in sync, but ignore it — we
+                    // draw our own SyntheticCursor. Payload: w*h pixels (4 bytes each) + a
+                    // 1-bit-per-pixel mask (ceil(w/8) bytes per row).
                     if (w > 0 && h > 0) {
-                        val pixelBytes = ByteArray(w * h * 4)
-                        inp.readFully(pixelBytes)
-                        val maskRowBytes = (w + 7) / 8
-                        val maskBytes = ByteArray(maskRowBytes * h)
-                        inp.readFully(maskBytes)
-                        val argb = IntArray(w * h)
-                        for (py in 0 until h) {
-                            for (px in 0 until w) {
-                                val o = (py * w + px) * 4
-                                val r = pixelBytes[o].toInt() and 0xFF
-                                val g = pixelBytes[o + 1].toInt() and 0xFF
-                                val b = pixelBytes[o + 2].toInt() and 0xFF
-                                val maskByte = maskBytes[py * maskRowBytes + px / 8].toInt()
-                                val opaque = (maskByte shr (7 - (px % 8))) and 1 == 1
-                                argb[py * w + px] = if (opaque) (0xFF shl 24) or (r shl 16) or (g shl 8) or b else 0
-                            }
-                        }
-                        cursorBitmap = Bitmap.createBitmap(argb, w, h, Bitmap.Config.ARGB_8888)
-                        cursorHotspotX = x
-                        cursorHotspotY = y
-                    } else {
-                        cursorBitmap = null // 0x0 cursor rect = server asking us to hide it
+                        inp.skipBytes(w * h * 4)
+                        inp.skipBytes(((w + 7) / 8) * h)
                     }
                 }
                 ENCODING_DESKTOP_SIZE -> {
-                    // No pixel data — x/y are unused (0), w/h are the new full framebuffer size.
-                    // Reallocate; RemoteDesktopScreen's letterbox fit picks up the new aspect
-                    // ratio on the very next blit with no further plumbing needed.
+                    // No pixel data — w/h are the new full framebuffer size. Reallocate; the next
+                    // blit's letterbox fit picks up the new aspect ratio automatically.
                     Log.i(TAG, "DesktopSize changed: ${fbWidth}x$fbHeight -> ${w}x$h")
                     fbWidth = w
                     fbHeight = h
+                    pointerFbX = pointerFbX.coerceIn(0, w - 1)
+                    pointerFbY = pointerFbY.coerceIn(0, h - 1)
                     framebuffer = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
                 }
                 else -> throw IOException("Unsupported encoding $encoding — server ignored our SetEncodings")
@@ -438,42 +387,31 @@ class VncClient(
         val fb = framebuffer ?: return
         val surface = targetSurface ?: return
         if (!surface.isValid) return
-        try {
-            val canvas = surface.lockCanvas(null) ?: return
+        synchronized(renderLock) {
             try {
-                // Letterbox * zoom: base fit preserves aspect ratio (min of the two axis scales,
-                // centered); zoomScale/panX/panY (from setZoom) then scale/shift that on top,
-                // re-centering around the zoomed size so a pinch feels anchored rather than
-                // jumping the image around. The combined values are what sendPointerEvent inverts.
-                val sw = canvas.width
-                val sh = canvas.height
-                val baseScale = minOf(sw.toFloat() / fb.width, sh.toFloat() / fb.height)
-                val scale = baseScale * zoomScale
-                val dw = fb.width * scale
-                val dh = fb.height * scale
-                val ox = (sw - dw) / 2f + panX
-                val oy = (sh - dh) / 2f + panY
-                renderScale = scale
-                renderOffsetX = ox
-                renderOffsetY = oy
-                canvas.drawColor(Color.BLACK)
-                canvas.drawBitmap(fb, null, RectF(ox, oy, ox + dw, oy + dh), null)
-
-                // Locally-drawn cursor overlay (see ENCODING_CURSOR) at the last position we told
-                // the server the pointer was at — most VNC servers (including UltraVNC) don't
-                // draw the pointer into the framebuffer pixels themselves.
-                cursorBitmap?.let { cursor ->
-                    val cx = ox + (lastPointerFbX - cursorHotspotX) * scale
-                    val cy = oy + (lastPointerFbY - cursorHotspotY) * scale
-                    val cw = cursor.width * scale
-                    val ch = cursor.height * scale
-                    canvas.drawBitmap(cursor, null, RectF(cx, cy, cx + cw, cy + ch), null)
+                val canvas = surface.lockCanvas(null) ?: return
+                try {
+                    // Base letterbox fit (aspect-preserving, centred) * pinch-zoom on top. The
+                    // combined scale/offset are stored for sendPointerEvent's inverse mapping.
+                    val sw = canvas.width
+                    val sh = canvas.height
+                    val scale = minOf(sw.toFloat() / fb.width, sh.toFloat() / fb.height) * zoomScale
+                    val dw = fb.width * scale
+                    val dh = fb.height * scale
+                    val ox = (sw - dw) / 2f + panX
+                    val oy = (sh - dh) / 2f + panY
+                    renderScale = scale
+                    renderOffsetX = ox
+                    renderOffsetY = oy
+                    canvas.drawColor(Color.BLACK)
+                    canvas.drawBitmap(fb, null, RectF(ox, oy, ox + dw, oy + dh), null)
+                    SyntheticCursor.draw(canvas, ox + pointerFbX * scale, oy + pointerFbY * scale)
+                } finally {
+                    surface.unlockCanvasAndPost(canvas)
                 }
-            } finally {
-                surface.unlockCanvasAndPost(canvas)
+            } catch (e: Exception) {
+                Log.w(TAG, "blitToSurface failed: ${e.message}")
             }
-        } catch (e: Exception) {
-            Log.w(TAG, "blitToSurface failed: ${e.message}")
         }
     }
 }
