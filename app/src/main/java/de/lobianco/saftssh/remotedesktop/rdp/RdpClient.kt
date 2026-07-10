@@ -6,6 +6,7 @@ import android.graphics.Color
 import android.graphics.RectF
 import android.net.Uri
 import android.util.Log
+import android.view.KeyEvent
 import android.view.Surface
 import com.freerdp.freerdpcore.services.LibFreeRDP
 import de.lobianco.saftssh.remotedesktop.SyntheticCursor
@@ -283,10 +284,28 @@ class RdpClient(
         blitToSurface()
     }
 
+    // Which of Ctrl/Alt/Win are currently held (tracked from the key events themselves). When one
+    // is held, printable letters/digits must go through the Virtual-Key (scancode) path so the
+    // remote applies the modifier — Windows does NOT combine a held modifier with a char delivered
+    // via the separate Unicode keyboard PDU. Shift is excluded: shift+letter is just an uppercase
+    // char, which the Unicode path already carries.
+    @Volatile private var ctrlHeld = false
+    @Volatile private var altHeld = false
+    @Volatile private var winHeld = false
+
     fun sendKeyEvent(keyCode: Int, unicodeChar: Int, down: Boolean) {
+        when (keyCode) {
+            KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.KEYCODE_CTRL_RIGHT -> ctrlHeld = down
+            KeyEvent.KEYCODE_ALT_LEFT, KeyEvent.KEYCODE_ALT_RIGHT -> altHeld = down
+            KeyEvent.KEYCODE_META_LEFT, KeyEvent.KEYCODE_META_RIGHT -> winHeld = down
+        }
+        if (ctrlHeld || altHeld || winHeld) {
+            val vk = RdpKeycode.vkForChar(unicodeChar)
+            if (vk != 0) { runCatching { LibFreeRDP.sendKeyEvent(inst, vk, down) }; return }
+        }
         when (val mapped = RdpKeycode.map(keyCode, unicodeChar)) {
             is RdpKeycode.Mapped.Unicode -> runCatching { LibFreeRDP.sendUnicodeKeyEvent(inst, mapped.codepoint, down) }
-            is RdpKeycode.Mapped.Scancode -> runCatching { LibFreeRDP.sendKeyEvent(inst, mapped.code, down) }
+            is RdpKeycode.Mapped.VirtualKey -> runCatching { LibFreeRDP.sendKeyEvent(inst, mapped.vk, down) }
             RdpKeycode.Mapped.None -> {}
         }
     }
