@@ -30,6 +30,7 @@ object AndroidKeysym {
             KeyEvent.KEYCODE_MOVE_HOME -> 0xFF50
             KeyEvent.KEYCODE_MOVE_END -> 0xFF57
             KeyEvent.KEYCODE_INSERT -> 0xFF63
+            KeyEvent.KEYCODE_CAPS_LOCK -> 0xFFE5
             KeyEvent.KEYCODE_SHIFT_LEFT -> 0xFFE1
             KeyEvent.KEYCODE_SHIFT_RIGHT -> 0xFFE2
             KeyEvent.KEYCODE_CTRL_LEFT -> 0xFFE3

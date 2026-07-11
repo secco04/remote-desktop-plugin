@@ -54,6 +54,29 @@ https://github.com/iiordanov/remote-desktop-clients for how that specific
 build was produced. None of these binaries were modified from the release
 build before being bundled here.
 
+SPICE support (app/src/main/java/de/lobianco/saftssh/remotedesktop/spice/)
+is a from-scratch headless Kotlin client written for this project. Its
+Java-side native bridge, com/undatech/opaque/SpiceCommunicator.kt, is a
+minimal reimplementation (NOT a copy) of the class name/package
+com.undatech.opaque.SpiceCommunicator that iiordanov/remote-desktop-clients'
+own remoteClientLib/src/main/java/com/undatech/opaque/SpiceCommunicator.java
+(GPL-3.0) declares -- the exact package/class name and a subset of its
+`native` method signatures had to be kept identical because libspice.so's
+JNI entry points and callback lookups (Java_com_undatech_opaque_
+SpiceCommunicator_*, found via FindClass/GetStaticMethodID against that
+exact class -- confirmed by inspecting android-service.c/android-io.c in
+the vendored submodule, not guessed) are compiled against them; none of that
+file's actual Java logic (Viewable/RfbConnectable/USB/oVirt plumbing) was
+copied. org/freedesktop/gstreamer/GStreamer.java is vendored verbatim from
+the GStreamer project's own public "copy this file into your Android
+project" Android-integration boilerplate (LGPL-2.1, distribution-permissive
+by design). The native libraries (libspice.so, libgstreamer_android.so) and
+the GStreamer font/CA-certificate assets (assets/fontconfig/,
+assets/ssl/certs/) are prebuilt/unmodified, extracted from iiordanov/
+remote-desktop-clients' official "freeaSPICE" GitHub Release APK (v6.4.5,
+same release as the RDP libraries above) for the same from-source-build-
+infeasible reason. spice-gtk and GStreamer are both LGPL-2.1 upstream.
+
 ----
 
                     GNU GENERAL PUBLIC LICENSE

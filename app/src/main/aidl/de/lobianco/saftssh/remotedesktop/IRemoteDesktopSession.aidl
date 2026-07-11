@@ -50,6 +50,14 @@ interface IRemoteDesktopSession {
     /** True if the underlying connection is still alive. */
     boolean isAlive();
 
-    /** Tears down the connection and releases the Surface. */
-    void destroy();
+    /**
+     * Tears down the connection and releases the Surface. oneway: the native VNC/RDP teardown
+     * (closing sockets, freeing the FreeRDP instance) can block for an unbounded time — e.g.
+     * FreeRDP's disconnect() waits for its own connect-thread to unwind, which can stall on a
+     * slow/stuck network. A synchronous call here blocks the CALLER (the main app's UI thread,
+     * since disconnect happens directly from a Compose click handler) for that whole duration —
+     * confirmed on-device as an ANR when ending an RDP session. Fire-and-forget instead; nothing
+     * needs to wait for the plugin's cleanup to finish.
+     */
+    oneway void destroy();
 }

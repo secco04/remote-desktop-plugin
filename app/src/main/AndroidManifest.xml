@@ -33,7 +33,7 @@
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Keeps a user-started remote desktop session (VNC/RDP/SPICE) alive while backgrounded" />
+                android:value="Keeps a user-started remote desktop session (VNC/RDP/SPICE/noVNC) alive while backgrounded" />
             <intent-filter>
                 <action android:name="de.lobianco.saftssh.remotedesktop.BIND_SESSION_SERVICE" />
             </intent-filter>

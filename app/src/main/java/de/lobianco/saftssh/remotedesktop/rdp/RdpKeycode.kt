@@ -44,6 +44,7 @@ object RdpKeycode {
     private const val VK_DELETE = 0x2E
     private const val VK_LWIN = 0x5B
     private const val VK_F1 = 0x70
+    private const val VK_CAPITAL = 0x14 // Caps Lock
 
     /** The VK code for a non-printable / modifier key, or null if [keyCode] isn't one we map here
      *  (printables are handled by the caller via Unicode). */
@@ -62,6 +63,7 @@ object RdpKeycode {
         KeyEvent.KEYCODE_MOVE_HOME -> VK_HOME
         KeyEvent.KEYCODE_MOVE_END -> VK_END
         KeyEvent.KEYCODE_INSERT -> VK_INSERT
+        KeyEvent.KEYCODE_CAPS_LOCK -> VK_CAPITAL
         KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.KEYCODE_CTRL_RIGHT -> VK_CONTROL
         KeyEvent.KEYCODE_ALT_LEFT, KeyEvent.KEYCODE_ALT_RIGHT -> VK_MENU
         KeyEvent.KEYCODE_SHIFT_LEFT, KeyEvent.KEYCODE_SHIFT_RIGHT -> VK_SHIFT

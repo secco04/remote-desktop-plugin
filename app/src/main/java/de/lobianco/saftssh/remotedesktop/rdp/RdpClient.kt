@@ -64,9 +64,16 @@ class RdpClient(
     private val password: String?,
     /** The hosting Surface's actual size at connect time, used as the requested RDP session
      *  resolution (see the /size query param below) so the remote desktop fills the visible
-     *  viewport instead of a fixed default — 0 falls back to a sane default. */
+     *  viewport instead of a fixed default — 0 falls back to a sane default. May instead be an
+     *  explicit override from the connection-settings menu — the caller (RemoteDesktopSessionService)
+     *  resolves which one this is before constructing this class. */
     private val initialWidth: Int,
     private val initialHeight: Int,
+    /** false ("Balanced") = 32-bit colour (unchanged default). true ("Fast") = 16-bit — half the
+     *  GDI pixel bandwidth FreeRDP has to push per update, at some banding on gradients. Fixed for
+     *  the session's lifetime — FreeRDP negotiates colour depth once at connect, so changing this
+     *  means reconnecting (see IRemoteDesktopSessionService.createSession's doc). */
+    private val fastQuality: Boolean = false,
     private val onProgress: (String) -> Unit,
     private val onConnected: (width: Int, height: Int) -> Unit,
     private val onDisconnected: (reason: String) -> Unit,
@@ -96,6 +103,10 @@ class RdpClient(
     // Last pointer position we sent, in framebuffer pixels — where SyntheticCursor is drawn.
     @Volatile private var pointerFbX = 0
     @Volatile private var pointerFbY = 0
+    // Throttles the cursor-move-triggered redraw to ~60fps — see VncClient's identical field for
+    // why (touch delivers move events far faster than that, and every redraw takes renderLock,
+    // so unthrottled it can starve real OnGraphicsUpdate-driven redraws and look "laggy").
+    @Volatile private var lastCursorBlitMs = 0L
     // Serialises lockCanvas/unlock between the FreeRDP graphics-update thread and Binder threads
     // calling in on a pointer move (see VncClient for the same reasoning).
     private val renderLock = Any()
@@ -199,11 +210,18 @@ class RdpClient(
         // "enable" Unicode keyboard input in this version — sendUnicodeKeyEvent() works
         // independently of the negotiated keyboard layout, which only matters for scancodes.
         val sizeParam = if (initialWidth > 0 && initialHeight > 0) "${initialWidth}x$initialHeight" else "1280x800"
+        // /bpp only affects what colour depth the SERVER negotiates/encodes over the wire — our
+        // own bitmap (allocateFramebuffer) is always ARGB_8888 regardless: FreeRDP's native GDI
+        // layer always keeps its own internal primary buffer at RGBX32 (gdi_init in
+        // android_post_connect hardcodes it) and jni_freerdp_update_graphics converts FROM that
+        // TO whatever format our bitmap reports via AndroidBitmap_getInfo — so lowering this to 16
+        // is a pure network-bandwidth win with no local pixel-format plumbing needed.
+        val bppParam = if (fastQuality) "16" else "32"
         val uriBuilder = Uri.Builder()
             .scheme("freerdp")
             .encodedAuthority(buildAuthority())
             .appendQueryParameter("size", sizeParam)
-            .appendQueryParameter("bpp", "32")
+            .appendQueryParameter("bpp", bppParam)
             .appendQueryParameter("clipboard", "")
             .appendQueryParameter("sec", "nla") // most modern Windows hosts require NLA by default
 
@@ -278,15 +296,34 @@ class RdpClient(
         pointerFbX = mx
         pointerFbY = my
         val currentFlag = rdpButtonFlag(buttonMask)
+        // Confirmed against FreeRDP's own reference Android client (Mouse.java /
+        // SessionActivity.java's onTouchPointerMove/onTouchPointerLeftClick):
+        //  - A button PRESS is its own one-time event: PTR_FLAGS_DOWN|BUTTONn alone, no MOVE bit.
+        //  - Ongoing movement — INCLUDING while a button is held (dragging) — is reported as
+        //    plain PTR_FLAGS_MOVE, with no button flag at all; the reference's onTouchPointerMove
+        //    always sends just Mouse.getMoveEvent() regardless of button state. Re-asserting
+        //    PTR_FLAGS_DOWN|BUTTONn on every move sample during a drag (an earlier version of
+        //    this code did that) is a repeated "fresh press" the server has no reason to treat as
+        //    a continuous drag, which is very likely why "everything except a single tap" (drag,
+        //    and by extension anything depending on a held button) didn't work.
+        //  - RELEASE is BUTTONn alone (no DOWN, no MOVE).
         val flags = when {
-            currentFlag != 0 -> PTR_FLAGS_MOVE or PTR_FLAGS_DOWN or currentFlag // press or drag
+            currentFlag != 0 && currentFlag != lastButtonFlag -> PTR_FLAGS_DOWN or currentFlag // fresh press
+            currentFlag != 0 -> PTR_FLAGS_MOVE // still held — just a position sample, no re-press
             lastButtonFlag != 0 -> lastButtonFlag // release (flag without DOWN = button-up)
             else -> PTR_FLAGS_MOVE // hover / move with no button
         }
         lastButtonFlag = currentFlag
         runCatching { LibFreeRDP.sendCursorEvent(inst, mx, my, flags) }
-        // Redraw so the synthetic cursor tracks the pointer between server frames.
-        blitToSurface()
+            .onSuccess { ok -> if (buttonMask != 0 || currentFlag != 0) Log.i(TAG, "sendCursorEvent($mx,$my,flags=0x${flags.toString(16)}) inst=$inst connected=$connected -> $ok") }
+            .onFailure { e -> Log.w(TAG, "sendCursorEvent threw", e) }
+        // Redraw so the synthetic cursor tracks the pointer between server frames. Throttled (see
+        // lastCursorBlitMs's doc) so a fast drag can't starve real protocol-driven redraws.
+        val now = System.currentTimeMillis()
+        if (now - lastCursorBlitMs >= 16L) {
+            lastCursorBlitMs = now
+            blitToSurface()
+        }
     }
 
     // Which of Ctrl/Alt/Win are currently held (tracked from the key events themselves). When one

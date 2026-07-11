@@ -12,14 +12,38 @@ android {
         applicationId = "de.lobianco.saftssh.remotedesktop"
         minSdk = 26
         targetSdk = 37
-        versionCode = 10
-        versionName = "0.10"
+        versionCode = 11
+        versionName = "0.11"
     }
 
     buildFeatures {
         aidl = true
     }
-
+    // One APK per ABI instead of a single universal one bundling every architecture's copy of
+    // the native libs (FreeRDP + SPICE/GStreamer) — that fat APK was ~146MB even after dropping
+    // the unused x86/x86_64 folders, because it still carried BOTH arm64-v8a's (~84MB) and
+    // armeabi-v7a's (~63MB) libs in the one file. Sideloaded directly (no Play Store dynamic
+    // delivery here), so isUniversalApk stays off — pick the APK matching the target device's ABI
+    // (arm64-v8a for any real phone from the last ~8 years, which covers this project's own
+    // OnePlus test device) instead of building/shipping the redundant combined file too.
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "armeabi-v7a")
+            isUniversalApk = false
+        }
+    }
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -38,4 +62,11 @@ dependencies {
     // from-scratch client (vnc/VncClient.kt) and RDP vendors FreeRDP's own upstream JNI bridge
     // (com/freerdp/freerdpcore/services/LibFreeRDP.java) directly as source plus prebuilt native
     // libraries in src/main/jniLibs/ (picked up automatically by AGP). See README.md.
+
+    // Proxmox VE's VNC console is ALWAYS WebSocket-tunneled (pveproxy has no raw TCP VNC port
+    // reachable from outside — same CONNECT-tunnel-only architecture reasoning as SPICE's
+    // spiceproxy) — see vnc/ProxmoxVncWebSocket.kt. OkHttp's WebSocket support is the only new
+    // dependency this needs; pure Kotlin/Java, no native code, negligible size next to the SPICE
+    // native libs already bundled.
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }

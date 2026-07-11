@@ -51,7 +51,7 @@ class InfoActivity : Activity() {
         }
 
         val subtitle = TextView(this).apply {
-            text = "VNC / RDP / SPICE client engine"
+            text = "VNC / RDP / SPICE / noVNC client engine"
             textSize = 15f
             gravity = Gravity.CENTER
             setTextColor(Color.rgb(170, 180, 200))
@@ -61,7 +61,9 @@ class InfoActivity : Activity() {
         val description = TextView(this).apply {
             text = """
                 This plugin provides VNC, RDP, and SPICE remote-desktop
-                connectivity for the LobiShell app.
+                connectivity for the LobiShell app, including Proxmox VE
+                consoles (SPICE, with an automatic noVNC fallback when
+                a VM's Display isn't set to SPICE).
 
                 It works together with LobiShell over a background
                 service — no configuration is required here.

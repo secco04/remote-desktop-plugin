@@ -41,21 +41,39 @@ private const val ENCODING_DESKTOP_SIZE = -223 // §7.7.1: framebuffer resolutio
  * CopyRect(1) encodings, the DesktopSize(-223) pseudo-encoding (server-initiated resolution
  * change — e.g. many Windows VNC servers switch backing resolution for the lock/login screen,
  * which previously desynced this client's stream parsing and surfaced as an EOFException). The
- * pointer is drawn locally via [SyntheticCursor] (the Cursor(-239) pseudo-encoding is requested
- * and consumed so the server keeps the pointer out of the framebuffer pixels, but its shape is
- * ignored — a synthetic arrow is always drawn instead, which is reliable across servers and
- * essential for the trackpad-style input mode). Does NOT support: Tight/Hextile/ZRLE encodings
- * (servers that refuse to offer Raw will fail — most do offer it), clipboard sync.
+ * pointer is drawn locally: the Cursor(-239) pseudo-encoding is requested (so the server keeps
+ * the pointer out of the framebuffer pixels) and its shape is decoded and rendered, so
+ * context-sensitive cursors (I-beam over text, resize arrows over borders, hand over links)
+ * appear. [SyntheticCursor]'s arrow is the fallback until the server first sends a shape, and is
+ * essential for the trackpad-style input mode (where the tap position isn't the finger position).
+ * (RDP can't do this — FreeRDP 2.11.7's prebuilt Android native lib discards all cursor-shape
+ * updates in no-op Pointer callbacks, so it's synthetic-only there.) Does NOT support:
+ * Tight/Hextile/ZRLE encodings (servers that refuse to offer Raw will fail — most do offer it),
+ * clipboard sync.
  */
 class VncClient(
     private val host: String,
     private val port: Int,
     private val password: String?,
+    /** false ("Balanced") = 32-bit true-colour (unchanged default). true ("Fast") = 16-bit
+     *  RGB565 — half the wire bytes per pixel for Raw rectangles, at the cost of some banding on
+     *  gradients. Fixed for the session's lifetime; VNC has no live pixel-format renegotiation, so
+     *  changing this means reconnecting (see IRemoteDesktopSessionService.createSession's doc). */
+    private val fastQuality: Boolean = false,
     private val onProgress: (String) -> Unit,
     private val onConnected: (width: Int, height: Int) -> Unit,
     private val onDisconnected: (reason: String) -> Unit,
+    /** Proxmox VE only — when set, connects via [ProxmoxVncWebSocket] to this full
+     *  "https://host:port/api2/json/nodes/{node}/qemu/{vmid}/vncwebsocket?port=...&vncticket=..."
+     *  URL instead of a raw [Socket] to [host]:[port] — see that class's doc for why Proxmox's VNC
+     *  console has no other way to reach it. [host]/[port] above are still used for [onProgress]'s
+     *  message but not for the actual connection in this mode. */
+    private val wsUrl: String? = null,
+    private val wsCookie: String? = null,
+    private val wsCertFingerprint: String? = null,
 ) {
     @Volatile private var socket: Socket? = null
+    @Volatile private var proxmoxWs: ProxmoxVncWebSocket? = null
     @Volatile private var running = false
     @Volatile private var output: DataOutputStream? = null
     private var thread: Thread? = null
@@ -82,11 +100,29 @@ class VncClient(
     @Volatile private var panX = 0f
     @Volatile private var panY = 0f
 
-    // Last pointer position we sent to the server, in framebuffer pixels — where the synthetic
-    // cursor is drawn. Initialised to the framebuffer centre on connect so a cursor is visible
-    // immediately, before the user touches anything.
+    // Last pointer position we sent to the server, in framebuffer pixels — where the cursor is
+    // drawn. Initialised to the framebuffer centre on connect so a cursor is visible immediately,
+    // before the user touches anything.
     @Volatile private var pointerFbX = 0
     @Volatile private var pointerFbY = 0
+
+    // The server's own cursor shape, from the Cursor pseudo-encoding (RFC 6143 §7.7.2) — this is
+    // what reflects context-sensitive shapes (I-beam over text fields, resize arrows over window
+    // borders, hand over links, …). Null until the server sends one (or after it sends an empty
+    // 0x0 cursor to hide it); [SyntheticCursor]'s arrow is the fallback so there's always
+    // something visible. [cursorHotspotX]/[Y] are the click point within the shape, in cursor
+    // pixels.
+    @Volatile private var cursorBitmap: Bitmap? = null
+    @Volatile private var cursorHotspotX = 0
+    @Volatile private var cursorHotspotY = 0
+
+    // Throttles the cursor-move-triggered redraw (below) to ~60fps. Touch delivers move events
+    // much faster than that (often 100+/sec during a drag), and every blitToSurface() takes the
+    // same renderLock the protocol thread uses to draw real server updates — without this, a fast
+    // drag could keep the lock busy compositing cursor-only frames and visibly delay real
+    // framebuffer updates from ever getting drawn, which read as "slow/laggy rendering" even
+    // though the actual network transfer was fine.
+    @Volatile private var lastCursorBlitMs = 0L
 
     // lockCanvas/unlockCanvasAndPost must not be entered from two threads at once (the protocol
     // thread after a framebuffer update, and a Binder thread on a pointer move) — serialise them.
@@ -108,10 +144,12 @@ class VncClient(
     fun stop() {
         running = false
         runCatching { socket?.close() }
+        runCatching { proxmoxWs?.close() }
         thread?.interrupt()
     }
 
-    fun isAlive(): Boolean = running && socket?.isConnected == true && socket?.isClosed == false
+    fun isAlive(): Boolean = running &&
+        (socket?.let { it.isConnected && !it.isClosed } ?: (proxmoxWs != null))
 
     // ── Input ──────────────────────────────────────────────────────────────
 
@@ -136,8 +174,13 @@ class VncClient(
             Log.w(TAG, "sendPointerEvent failed: ${e.message}")
         }
         // The server won't push a frame just because our locally-drawn cursor moved — redraw so
-        // the cursor tracks the finger smoothly between real framebuffer updates.
-        blitToSurface()
+        // the cursor tracks the finger smoothly between real framebuffer updates. Throttled (see
+        // lastCursorBlitMs's doc) so a fast drag can't starve real protocol-driven redraws.
+        val now = System.currentTimeMillis()
+        if (now - lastCursorBlitMs >= 16L) {
+            lastCursorBlitMs = now
+            blitToSurface()
+        }
     }
 
     /** Mouse wheel via RFB PointerEvent button bits (RFC 6143: bit 3 = wheel up, bit 4 = wheel
@@ -183,11 +226,22 @@ class VncClient(
 
     private fun runProtocol() {
         try {
-            onProgress("Connecting to $host:$port…")
-            val sock = Socket(host, port).apply { tcpNoDelay = true; soTimeout = 15_000 }
-            socket = sock
-            val inp = DataInputStream(BufferedInputStream(sock.getInputStream(), 64 * 1024))
-            val out = DataOutputStream(BufferedOutputStream(sock.getOutputStream()))
+            val inp: DataInputStream
+            val out: DataOutputStream
+            if (wsUrl != null) {
+                onProgress("Connecting via Proxmox VE…")
+                val ws = ProxmoxVncWebSocket(wsUrl, wsCookie.orEmpty(), wsCertFingerprint)
+                proxmoxWs = ws
+                if (!ws.connectBlocking(15_000)) throw IOException("Proxmox VNC websocket failed to connect")
+                inp = DataInputStream(BufferedInputStream(ws.inputStream, 64 * 1024))
+                out = DataOutputStream(BufferedOutputStream(ws.outputStream))
+            } else {
+                onProgress("Connecting to $host:$port…")
+                val sock = Socket(host, port).apply { tcpNoDelay = true; soTimeout = 15_000 }
+                socket = sock
+                inp = DataInputStream(BufferedInputStream(sock.getInputStream(), 64 * 1024))
+                out = DataOutputStream(BufferedOutputStream(sock.getOutputStream()))
+            }
             output = out
 
             negotiateVersion(inp, out)
@@ -204,14 +258,23 @@ class VncClient(
             onConnected(w, h)
 
             requestFramebufferUpdate(out, incremental = false)
-            sock.soTimeout = 0 // block indefinitely on subsequent reads — the server paces updates
+            socket?.soTimeout = 0 // block indefinitely on subsequent reads — the server paces updates
+            // (the WebSocket path has no equivalent socket-level read timeout to clear — its
+            // InputStream already blocks indefinitely via ProxmoxVncWebSocket's queue.take())
             while (running) {
                 val messageType = inp.readUnsignedByte()
                 when (messageType) {
                     0 -> { // FramebufferUpdate
-                        handleFramebufferUpdate(inp)
+                        // Pipelined, not request-decode-draw-THEN-request: handleFramebufferUpdate
+                        // fires the next incremental request as soon as it's read the rectangle
+                        // count (see its own doc), before decoding any pixel data. A strict
+                        // request-then-wait-then-request loop caps the effective frame rate at
+                        // 1/round-trip-time — over WiFi with even modest latency, a remote desktop
+                        // updating faster than that visibly falls behind ("laggt nach"), since each
+                        // update has to wait for a full network round trip after the previous one
+                        // finished rendering instead of overlapping with it.
+                        handleFramebufferUpdate(inp, out)
                         blitToSurface()
-                        requestFramebufferUpdate(out, incremental = true)
                     }
                     1 -> { // SetColourMapEntries — not used (we request true-colour), drain it.
                         inp.skipBytes(1)
@@ -236,6 +299,7 @@ class VncClient(
         } finally {
             running = false
             runCatching { socket?.close() }
+            runCatching { proxmoxWs?.close() }
         }
     }
 
@@ -316,13 +380,22 @@ class VncClient(
         val name = ByteArray(nameLen).also { inp.readFully(it) }
         Log.i(TAG, "ServerInit: ${width}x$height name=${String(name)}")
 
-        // SetPixelFormat: 32-bit true-colour, byte order matching ARGB_8888's in-memory layout so
-        // Raw rectangles copy straight into the Bitmap with no per-pixel conversion.
+        // SetPixelFormat. Balanced (default): 32-bit true-colour, byte order matching
+        // ARGB_8888's in-memory layout so Raw rectangles copy straight into the Bitmap with no
+        // per-pixel conversion. Fast: 16-bit RGB565 (bits 15-11=R, 10-5=G, 4-0=B, little-endian on
+        // the wire — big-endian-flag=0) — half the Raw bytes/pixel; handleFramebufferUpdate does
+        // the 5/6-bit-to-8-bit expansion per pixel to build the ARGB_8888 bitmap.
         out.writeByte(0)
         out.write(byteArrayOf(0, 0, 0))
-        out.writeByte(32); out.writeByte(24); out.writeByte(0); out.writeByte(1)
-        out.writeShort(255); out.writeShort(255); out.writeShort(255)
-        out.writeByte(0); out.writeByte(8); out.writeByte(16)
+        if (fastQuality) {
+            out.writeByte(16); out.writeByte(16); out.writeByte(0); out.writeByte(1)
+            out.writeShort(31); out.writeShort(63); out.writeShort(31)
+            out.writeByte(11); out.writeByte(5); out.writeByte(0)
+        } else {
+            out.writeByte(32); out.writeByte(24); out.writeByte(0); out.writeByte(1)
+            out.writeShort(255); out.writeShort(255); out.writeShort(255)
+            out.writeByte(0); out.writeByte(8); out.writeByte(16)
+        }
         out.write(byteArrayOf(0, 0, 0))
         out.flush()
 
@@ -339,17 +412,59 @@ class VncClient(
         return width to height
     }
 
+    /** Synchronized on [out] — sendPointerEvent/sendKeyEvent/sendScroll (called from Binder
+     *  threads) write to this SAME stream under the same lock; without it here too, an
+     *  interleaved write from either side could corrupt the RFB byte stream (e.g. half of this
+     *  request mixed with half of a PointerEvent), which is exactly the kind of intermittent
+     *  protocol-level corruption that would surface as unpredictable lag/stalls rather than a
+     *  clean error. This method runs on the protocol thread only, so it doesn't race with itself. */
     private fun requestFramebufferUpdate(out: DataOutputStream, incremental: Boolean) {
-        out.writeByte(3)
-        out.writeByte(if (incremental) 1 else 0)
-        out.writeShort(0); out.writeShort(0)
-        out.writeShort(fbWidth); out.writeShort(fbHeight)
-        out.flush()
+        synchronized(out) {
+            out.writeByte(3)
+            out.writeByte(if (incremental) 1 else 0)
+            out.writeShort(0); out.writeShort(0)
+            out.writeShort(fbWidth); out.writeShort(fbHeight)
+            out.flush()
+        }
     }
 
-    private fun handleFramebufferUpdate(inp: DataInputStream) {
+    /** Bytes per pixel on the wire, matching whatever SetPixelFormat requested in serverInit(). */
+    private fun bytesPerPixel(): Int = if (fastQuality) 2 else 4
+
+    /** Decodes one pixel at byte offset [o] in [bytes] into an opaque ARGB_8888 int, per the
+     *  current wire pixel format. Balanced: 4 bytes, R/G/B in bytes 0/1/2 (matches ARGB_8888
+     *  directly). Fast: 2 bytes, little-endian RGB565 (big-endian-flag=0 was requested), expanded
+     *  to 8 bits/channel via bit replication (5→8: (v<<3)|(v>>2); 6→8: (v<<2)|(v>>4)) rather than
+     *  a plain left-shift, so e.g. 5-bit max (31) maps to 255, not 248 — avoids a visible ceiling
+     *  on white/saturated colours. Shared by both Raw rectangles and the Cursor pseudo-encoding,
+     *  which uses this same negotiated pixel format for its pixel data (RFC 6143 §7.7.2). */
+    private fun decodePixel(bytes: ByteArray, o: Int): Int {
+        return if (fastQuality) {
+            val pixel16 = (bytes[o].toInt() and 0xFF) or ((bytes[o + 1].toInt() and 0xFF) shl 8)
+            val r5 = (pixel16 shr 11) and 0x1F
+            val g6 = (pixel16 shr 5) and 0x3F
+            val b5 = pixel16 and 0x1F
+            val r8 = (r5 shl 3) or (r5 shr 2)
+            val g8 = (g6 shl 2) or (g6 shr 4)
+            val b8 = (b5 shl 3) or (b5 shr 2)
+            (0xFF shl 24) or (r8 shl 16) or (g8 shl 8) or b8
+        } else {
+            val r = bytes[o].toInt() and 0xFF
+            val g = bytes[o + 1].toInt() and 0xFF
+            val b = bytes[o + 2].toInt() and 0xFF
+            (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+        }
+    }
+
+    /** Reads and decodes one FramebufferUpdate. [out] is used to fire the NEXT incremental
+     *  request immediately after the rectangle count is known — before decoding a single pixel —
+     *  so the server can start preparing/sending the next update while we're still decoding and
+     *  drawing this one, instead of that round trip only starting after we finish. See the call
+     *  site's doc for why the non-pipelined version visibly fell behind. */
+    private fun handleFramebufferUpdate(inp: DataInputStream, out: DataOutputStream) {
         inp.skipBytes(1) // padding
         val numRects = inp.readUnsignedShort()
+        requestFramebufferUpdate(out, incremental = true)
         repeat(numRects) {
             val x = inp.readUnsignedShort()
             val y = inp.readUnsignedShort()
@@ -358,17 +473,12 @@ class VncClient(
             when (val encoding = inp.readInt()) {
                 ENCODING_RAW -> {
                     val fb = framebuffer ?: return@repeat
-                    val row = ByteArray(w * 4)
+                    val bpp = bytesPerPixel()
+                    val row = ByteArray(w * bpp)
                     val pixels = IntArray(w)
                     for (ry in 0 until h) {
                         inp.readFully(row)
-                        for (rx in 0 until w) {
-                            val o = rx * 4
-                            val r = row[o].toInt() and 0xFF
-                            val g = row[o + 1].toInt() and 0xFF
-                            val b = row[o + 2].toInt() and 0xFF
-                            pixels[rx] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-                        }
+                        for (rx in 0 until w) pixels[rx] = decodePixel(row, rx * bpp)
                         if (y + ry < fb.height) fb.setPixels(pixels, 0, w, x, y + ry, w.coerceAtMost(fb.width - x), 1)
                     }
                 }
@@ -381,12 +491,33 @@ class VncClient(
                     copy.recycle()
                 }
                 ENCODING_CURSOR -> {
-                    // Consume the cursor shape so the stream stays in sync, but ignore it — we
-                    // draw our own SyntheticCursor. Payload: w*h pixels (4 bytes each) + a
-                    // 1-bit-per-pixel mask (ceil(w/8) bytes per row).
+                    // RFC 6143 §7.7.2: x,y = hotspot; then w*h pixels in OUR CURRENT PIXEL FORMAT
+                    // (bytesPerPixel() bytes each — this must track whatever SetPixelFormat
+                    // requested, same as Raw rectangles, since the server encodes cursor pixels
+                    // the same way) followed by a 1-bit-per-pixel mask (ceil(w/8) bytes per row,
+                    // MSB first, 1 = opaque). Decode into an ARGB bitmap and use it as the cursor
+                    // so context-sensitive shapes (I-beam, resize arrows, hand) show up.
                     if (w > 0 && h > 0) {
-                        inp.skipBytes(w * h * 4)
-                        inp.skipBytes(((w + 7) / 8) * h)
+                        val bpp = bytesPerPixel()
+                        val pixelBytes = ByteArray(w * h * bpp).also { inp.readFully(it) }
+                        val maskStride = (w + 7) / 8
+                        val maskBytes = ByteArray(maskStride * h).also { inp.readFully(it) }
+                        val argb = IntArray(w * h)
+                        for (cy in 0 until h) {
+                            for (cx in 0 until w) {
+                                val o = (cy * w + cx) * bpp
+                                val maskBit = (maskBytes[cy * maskStride + (cx / 8)].toInt() shr (7 - (cx % 8))) and 1
+                                argb[cy * w + cx] = if (maskBit == 1) decodePixel(pixelBytes, o) else 0
+                            }
+                        }
+                        cursorBitmap = Bitmap.createBitmap(argb, w, h, Bitmap.Config.ARGB_8888)
+                        cursorHotspotX = x
+                        cursorHotspotY = y
+                    } else {
+                        // Empty 0x0 cursor rect = server asking us to hide the pointer.
+                        cursorBitmap = null
+                        cursorHotspotX = 0
+                        cursorHotspotY = 0
                     }
                 }
                 ENCODING_DESKTOP_SIZE -> {
@@ -426,7 +557,19 @@ class VncClient(
                     renderOffsetY = oy
                     canvas.drawColor(Color.BLACK)
                     canvas.drawBitmap(fb, null, RectF(ox, oy, ox + dw, oy + dh), null)
-                    SyntheticCursor.draw(canvas, ox + pointerFbX * scale, oy + pointerFbY * scale)
+                    // Draw the server's actual cursor shape if we have one (reflects I-beam /
+                    // resize / hand / etc.), positioned so its hotspot sits at the pointer; fall
+                    // back to the synthetic arrow until the server first sends a shape. Both are
+                    // scaled with the framebuffer so the cursor tracks the desktop's own pixel
+                    // size under zoom.
+                    val cursor = cursorBitmap
+                    if (cursor != null) {
+                        val cx = ox + (pointerFbX - cursorHotspotX) * scale
+                        val cy = oy + (pointerFbY - cursorHotspotY) * scale
+                        canvas.drawBitmap(cursor, null, RectF(cx, cy, cx + cursor.width * scale, cy + cursor.height * scale), null)
+                    } else {
+                        SyntheticCursor.draw(canvas, ox + pointerFbX * scale, oy + pointerFbY * scale)
+                    }
                 } finally {
                     surface.unlockCanvasAndPost(canvas)
                 }
