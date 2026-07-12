@@ -14,6 +14,26 @@ interface IRemoteDesktopSession {
     void resize(int width, int height);
 
     /**
+     * Hands the session a NEW Surface to draw onto, replacing the one from createSession(). A
+     * SurfaceView's Surface is destroyed whenever the hosting activity goes to the background and
+     * a different one is created on return — without this call the plugin keeps drawing onto the
+     * dead original, which is exactly the "black screen after backgrounding" symptom. The plugin
+     * immediately redraws its current framebuffer onto the new Surface, so the last frame shows
+     * right away instead of waiting for the server's next update. oneway: nothing to return, and
+     * it's called from the UI thread's surfaceChanged callback.
+     */
+    oneway void updateSurface(in android.view.Surface surface);
+
+    /**
+     * SPICE only: switches the keyboard layout ("us" | "de" | "fr") LIVE, without reconnecting.
+     * SPICE key input is client-side scancode mapping (see SpiceKeycode) — the layout only affects
+     * how the NEXT keystroke's character is turned into a scancode, so it can change mid-session
+     * with no protocol renegotiation. VNC/RDP ignore this (they send layout-independent Unicode).
+     * oneway: fire-and-forget, nothing to wait for.
+     */
+    oneway void setKeyboardLayout(String layout);
+
+    /**
      * Forwards a pointer/touch event. x/y are Surface-local pixels (the plugin maps them to
      * framebuffer coordinates via its current letterbox+zoom geometry, see [setZoom]).
      * buttonMask follows the RFC 6143 (VNC) convention every real VNC/RDP client uses: bit 0 =

@@ -14,6 +14,7 @@ import android.view.Surface
 import de.lobianco.saftssh.remotedesktop.rdp.RdpCertStore
 import de.lobianco.saftssh.remotedesktop.rdp.RdpClient
 import de.lobianco.saftssh.remotedesktop.spice.SpiceClient
+import de.lobianco.saftssh.remotedesktop.spice.SpiceKeyboardLayout
 import de.lobianco.saftssh.remotedesktop.vnc.AndroidKeysym
 import de.lobianco.saftssh.remotedesktop.vnc.VncClient
 
@@ -137,7 +138,7 @@ class RemoteDesktopSessionService : Service() {
             callback: IRemoteDesktopSessionCallback?,
             fastQuality: Boolean, overrideWidth: Int, overrideHeight: Int,
             tlsPort: Int, proxy: String?, caCert: String?, hostSubject: String?,
-            vncWsUrl: String?, vncWsCookie: String?,
+            vncWsUrl: String?, vncWsCookie: String?, keyboardLayout: String?,
         ): IRemoteDesktopSession? {
             if (!isCallerAuthorized()) return null
             return try {
@@ -148,7 +149,7 @@ class RemoteDesktopSessionService : Service() {
                     protocol, host, port, username, password, surface, width, height, callback,
                     fastQuality, overrideWidth, overrideHeight,
                     tlsPort, proxy, caCert, hostSubject,
-                    vncWsUrl, vncWsCookie,
+                    vncWsUrl, vncWsCookie, keyboardLayout,
                 )
                 openSessions.add(session)
                 promoteToForeground()
@@ -182,7 +183,7 @@ class RemoteDesktopSessionService : Service() {
         callback: IRemoteDesktopSessionCallback?,
         fastQuality: Boolean, overrideWidth: Int, overrideHeight: Int,
         tlsPort: Int, proxy: String?, caCert: String?, hostSubject: String?,
-        vncWsUrl: String?, vncWsCookie: String?,
+        vncWsUrl: String?, vncWsCookie: String?, keyboardLayout: String?,
     ): SessionImpl {
         val session = SessionImpl()
         when (protocol) {
@@ -273,6 +274,11 @@ class RemoteDesktopSessionService : Service() {
                     proxy = proxy,
                     caCert = caCert,
                     hostSubject = hostSubject,
+                    initialKeyboardLayout = when (keyboardLayout) {
+                        "de" -> SpiceKeyboardLayout.DE
+                        "fr" -> SpiceKeyboardLayout.FR
+                        else -> SpiceKeyboardLayout.US
+                    },
                 )
                 client.targetSurface = surface
                 session.spiceClient = client
@@ -310,6 +316,26 @@ class RemoteDesktopSessionService : Service() {
             // none, and RDP's negotiated resolution comes from OnGraphicsResize instead. Both
             // blitToSurface() implementations already scale to whatever size the Surface
             // currently is, so a caller-side resize just needs the next frame to notice.
+        }
+
+        override fun updateSurface(surface: Surface?) {
+            if (surface == null) return
+            try {
+                vncClient?.updateSurface(surface)
+                rdpClient?.updateSurface(surface)
+                spiceClient?.updateSurface(surface)
+            } catch (e: Exception) {
+                Log.w(TAG, "updateSurface handling failed", e)
+            }
+        }
+
+        override fun setKeyboardLayout(layout: String?) {
+            val parsed = when (layout) {
+                "de" -> SpiceKeyboardLayout.DE
+                "fr" -> SpiceKeyboardLayout.FR
+                else -> SpiceKeyboardLayout.US
+            }
+            runCatching { spiceClient?.setKeyboardLayout(parsed) }
         }
 
         override fun sendPointerEvent(x: Int, y: Int, buttonMask: Int) {
@@ -391,12 +417,28 @@ class RemoteDesktopSessionService : Service() {
                 // share one process — kill this one now so the next createSession() (any protocol)
                 // starts against a freshly loaded native library. Harmless for VNC/RDP: this only
                 // runs once ALL sessions (not just this one) are closed.
+                //
+                // openSessions.isEmpty() is re-checked AFTER the sleep, immediately before actually
+                // killing — NOT just once up front. Without this second check, a fast reconnect
+                // (e.g. the connection-settings menu's Quality/Keyboard-Layout picker, which tears
+                // down and immediately recreates a session — see RemoteDesktopViewModel.retry())
+                // creates its brand-new SPICE session INSIDE this 300ms grace window; openSessions
+                // is non-empty again by the time this fires, but the old unconditional kill didn't
+                // care and blew away the whole process — including the fresh session that had just
+                // started connecting — before it could ever reach onConnected(). Since a process
+                // kill has no AIDL-level "connection failed" callback (the Binder connection just
+                // vanishes), the main app never left its Connecting state: the reported "loading
+                // spinner spins forever after changing Quality" bug, confirmed via this exact race.
                 Thread({
                     // Give the oneway destroy() call's Binder transaction and this log line time
                     // to actually flush before the process disappears out from under them.
                     Thread.sleep(300)
-                    Log.i(TAG, "Restarting plugin process after a SPICE session (see destroyInternal's doc)")
-                    android.os.Process.killProcess(android.os.Process.myPid())
+                    if (openSessions.isEmpty()) {
+                        Log.i(TAG, "Restarting plugin process after a SPICE session (see destroyInternal's doc)")
+                        android.os.Process.killProcess(android.os.Process.myPid())
+                    } else {
+                        Log.i(TAG, "Skipping scheduled process restart — a new session started during the grace window")
+                    }
                 }, "SpiceProcessRestart").apply { isDaemon = true; start() }
             }
         }

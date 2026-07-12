@@ -11,8 +11,14 @@ object AndroidKeysym {
     fun map(keyCode: Int, unicodeChar: Int): Int {
         // A resolved Unicode character (from KeyEvent.getUnicodeChar(), already accounting for
         // shift/caps-lock state) maps 1:1 onto its own codepoint for the printable Latin-1 range
-        // — X11 keysyms are defined to equal the Unicode codepoint for 0x20..0xFF.
-        if (unicodeChar in 0x20..0xFF) return unicodeChar
+        // — X11 keysyms are defined to equal the Unicode codepoint for 0x20..0x7E and 0xA0..0xFF.
+        // 0x7F..0x9F are NOT printable (0x7F is the ASCII DEL control character, 0x80..0x9F are C1
+        // controls) and must fall through to the keyCode switch below instead — confirmed on-device
+        // bug: Android's KeyEvent.getUnicodeChar() for KEYCODE_DEL (Backspace) resolves to 0x7F, which
+        // this range check used to treat as a "printable" char and return literally as keysym 0x7F —
+        // not a valid X11 Backspace keysym (that's 0xFF08, produced by the switch below), so VNC/noVNC
+        // servers silently ignored every Backspace press.
+        if (unicodeChar in 0x20..0x7E || unicodeChar in 0xA0..0xFF) return unicodeChar
 
         return when (keyCode) {
             KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> 0xFF0D

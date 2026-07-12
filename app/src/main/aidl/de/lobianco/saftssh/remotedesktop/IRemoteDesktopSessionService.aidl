@@ -40,6 +40,11 @@ interface IRemoteDesktopSessionService {
      * fingerprint (hex-colon form) to pin the WebSocket's TLS connection against — see
      * ProxmoxVncWebSocket's class doc for why a second separate trust prompt isn't needed. Non-null
      * [vncWsUrl] selects this path; null is a plain direct VNC connect to [host]:[port] instead.
+     *
+     * [keyboardLayout]: SPICE only — "us" or "de". SPICE has no Unicode input path (scancodes
+     * only, see SpiceKeycode's class doc in the plugin), so correct character delivery depends on
+     * this matching the remote guest OS's own configured keyboard layout. Ignored by VNC/RDP,
+     * which are already layout-independent (X11 keysyms / TS_UNICODE_KEYBOARD_EVENT respectively).
      */
     IRemoteDesktopSession createSession(
         String protocol, String host, int port, String username, String password,
@@ -47,7 +52,7 @@ interface IRemoteDesktopSessionService {
         in IRemoteDesktopSessionCallback callback,
         boolean fastQuality, int overrideWidth, int overrideHeight,
         int tlsPort, String proxy, String caCert, String hostSubject,
-        String vncWsUrl, String vncWsCookie);
+        String vncWsUrl, String vncWsCookie, String keyboardLayout);
 
     /**
      * RDP only: marks [host]:[port]'s current TLS certificate ([fingerprint], as reported via

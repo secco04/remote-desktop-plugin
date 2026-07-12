@@ -43,6 +43,7 @@ captures/
 # Keystore files — NEVER commit!
 *.jks
 *.keystore
+keystore.properties
 
 # External native build
 .externalNativeBuild/

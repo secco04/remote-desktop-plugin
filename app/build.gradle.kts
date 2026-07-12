@@ -1,7 +1,24 @@
+import java.io.FileInputStream
+import java.util.Properties
+
 plugins {
     // AGP 9.x has built-in Kotlin support — the org.jetbrains.kotlin.android plugin must NOT be
     // applied (it errors out). Same as the Linux Plugin's app/build.gradle.kts.
     id("com.android.application")
+}
+
+// Release signing: reads from app/keystore.properties, which is gitignored and never generated
+// by this build script — create it yourself (locally only) pointing at your own release keystore:
+//   storeFile=/absolute/or/relative/path/to/your.jks
+//   storePassword=...
+//   keyAlias=...
+//   keyPassword=...
+// Missing file = release builds stay unsigned (today's behavior, no regression) rather than
+// failing the whole build — so a fresh checkout without this file still builds fine.
+val keystorePropertiesFile = file("keystore.properties")
+val hasKeystoreConfig = keystorePropertiesFile.exists()
+val keystoreProperties = Properties().apply {
+    if (hasKeystoreConfig) load(FileInputStream(keystorePropertiesFile))
 }
 
 android {
@@ -12,8 +29,8 @@ android {
         applicationId = "de.lobianco.saftssh.remotedesktop"
         minSdk = 26
         targetSdk = 37
-        versionCode = 11
-        versionName = "0.11"
+        versionCode = 12
+        versionName = "0.12"
     }
 
     buildFeatures {
@@ -34,8 +51,21 @@ android {
             isUniversalApk = false
         }
     }
+    signingConfigs {
+        if (hasKeystoreConfig) {
+            create("release") {
+                storeFile = file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
+        }
+    }
     buildTypes {
         release {
+            if (hasKeystoreConfig) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(

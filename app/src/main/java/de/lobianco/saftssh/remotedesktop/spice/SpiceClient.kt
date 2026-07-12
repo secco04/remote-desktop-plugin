@@ -13,6 +13,9 @@ import java.io.File
 import java.util.UUID
 
 private const val TAG = "SpiceClient"
+// See blitToSurface's doc — how long to back off between retry attempts once lockCanvas() starts
+// failing (e.g. display asleep), instead of retrying on every single incoming server frame.
+private const val BLIT_RETRY_INTERVAL_MS = 2000L
 
 // SPICE mouse-button numbering — verified against the vendored reference implementation
 // (bVNC/src/.../input/RemoteSpicePointer.java), not guessed: 1=left, 2=middle, 3=right,
@@ -84,12 +87,26 @@ class SpiceClient(
     /** PEM certificate (real newlines OK — re-encoded to the .vv format's escaped form here). */
     private val caCert: String? = null,
     private val hostSubject: String? = null,
+    /** Which physical keyboard layout to assume when resolving typed characters to scancodes —
+     *  see [SpiceKeycode]'s class doc for why this is needed at all (SPICE has no Unicode input
+     *  path, only scancodes, which are layout-dependent). Defaults to US, unchanged behavior.
+     *  Mutable at runtime via [setKeyboardLayout] — it only affects the NEXT keystroke's mapping,
+     *  so it can change live with no reconnect. */
+    initialKeyboardLayout: SpiceKeyboardLayout = SpiceKeyboardLayout.US,
 ) : SpiceCommunicator.Listener {
+
+    // Read on whatever Binder thread delivers a key event, written on whatever Binder thread
+    // delivers a setKeyboardLayout() — @Volatile so a live switch is seen immediately.
+    @Volatile private var keyboardLayout: SpiceKeyboardLayout = initialKeyboardLayout
+
+    /** Live keyboard-layout switch (see the AIDL setKeyboardLayout doc) — no reconnect needed. */
+    fun setKeyboardLayout(layout: SpiceKeyboardLayout) { keyboardLayout = layout }
 
     private val native = SpiceCommunicator()
     @Volatile private var bitmap: Bitmap? = null
     @Volatile private var connected = false
     private var thread: Thread? = null
+    @Volatile private var surfaceRefreshThread: Thread? = null
 
     @Volatile var targetSurface: Surface? = null
 
@@ -108,11 +125,35 @@ class SpiceClient(
     @Volatile private var relativeMode = false
     private val renderLock = Any()
 
+    // See blitToSurface's doc — backoff state for when lockCanvas() is failing (e.g. display
+    // asleep: "dequeueBuffer failed", which surface.isValid does NOT catch).
+    @Volatile private var blitFailing = false
+    @Volatile private var lastBlitAttemptMs = 0L
+
     fun setZoom(scale: Float, newPanX: Float, newPanY: Float) {
         zoomScale = scale.coerceAtLeast(0.1f)
         panX = newPanX
         panY = newPanY
         blitToSurface()
+    }
+
+    /** Swaps in a fresh Surface mid-session, with retried re-blits across the resize settle window
+     *  — see VncClient.updateSurface's doc for the full reasoning (a single blit can race the
+     *  reallocating buffer during an IME/rotation resize and, on a static remote screen, leave the
+     *  view frozen with nothing to re-trigger a draw). */
+    fun updateSurface(surface: Surface) {
+        targetSurface = surface
+        // See VncClient.updateSurface's identical reset — a fresh Surface shouldn't inherit the
+        // old one's display-off backoff.
+        blitFailing = false
+        surfaceRefreshThread?.interrupt()
+        surfaceRefreshThread = Thread {
+            for (delayMs in longArrayOf(0, 60, 150, 300, 550)) {
+                try { Thread.sleep(delayMs) } catch (_: InterruptedException) { return@Thread }
+                if (targetSurface !== surface) return@Thread
+                blitToSurface()
+            }
+        }.apply { isDaemon = true; start() }
     }
 
     /** Throws if another SPICE session is already active, or the connect thread otherwise can't be
@@ -177,6 +218,12 @@ class SpiceClient(
     }
 
     fun stop() {
+        // See VncClient.stop()'s doc for why this is cleared first, before any teardown call that
+        // might itself take a moment — a fast disconnect+reconnect (e.g. the connection-settings
+        // menu) can have a brand-new session's client already targeting the same reused Surface
+        // before this old session's teardown has fully unwound.
+        targetSurface = null
+        surfaceRefreshThread?.interrupt()
         runCatching { native.SpiceClientDisconnect() }
         thread?.interrupt()
     }
@@ -270,14 +317,18 @@ class SpiceClient(
     }
 
     @Volatile private var shiftHeld = false
-    // Set when this class itself pressed Shift to type a shifted character the physical/virtual
-    // keyboard didn't already indicate Shift for (see sendKeyEvent) — released on the matching
-    // key-up so a synthesized "type '!'" tap doesn't leave a phantom Shift stuck down.
+    @Volatile private var altGrHeld = false
+    // Set when this class itself pressed Shift/AltGr to type a character the physical/virtual
+    // keyboard didn't already indicate that modifier for (see sendKeyEvent) — released on the
+    // matching key-up so a synthesized "type '!'"/"type '@'" tap doesn't leave a phantom modifier
+    // stuck down.
     @Volatile private var syntheticShiftHeld = false
+    @Volatile private var syntheticAltGrHeld = false
 
     fun sendKeyEvent(keyCode: Int, unicodeChar: Int, down: Boolean) {
         when (keyCode) {
             KeyEvent.KEYCODE_SHIFT_LEFT, KeyEvent.KEYCODE_SHIFT_RIGHT -> shiftHeld = down
+            KeyEvent.KEYCODE_ALT_RIGHT -> altGrHeld = down
         }
         // Non-printable / modifier / function key -> direct scancode.
         SpiceKeycode.scancodeForKeyCode(keyCode)?.let { sc ->
@@ -286,17 +337,29 @@ class SpiceClient(
         }
         // Printable character: a real hardware key with a resolvable unicodeChar, or a synthesized
         // tap (keyCode=0, from clipboard paste / the special-key bar's symbol keys).
-        val (sc, needsShift) = SpiceKeycode.scancodeForUnicode(unicodeChar) ?: return
+        val mapping = SpiceKeycode.scancodeForUnicode(unicodeChar, keyboardLayout) ?: return
         if (down) {
-            if (needsShift && !shiftHeld) {
+            if (mapping.shift && !shiftHeld) {
                 syntheticShiftHeld = true
                 SpiceKeycode.scancodeForKeyCode(KeyEvent.KEYCODE_SHIFT_LEFT)?.let {
                     runCatching { native.SpiceKeyEvent(true, it) }
                 }
             }
-            runCatching { native.SpiceKeyEvent(true, sc) }
+            if (mapping.altGr && !altGrHeld) {
+                syntheticAltGrHeld = true
+                SpiceKeycode.scancodeForKeyCode(KeyEvent.KEYCODE_ALT_RIGHT)?.let {
+                    runCatching { native.SpiceKeyEvent(true, it) }
+                }
+            }
+            runCatching { native.SpiceKeyEvent(true, mapping.scancode) }
         } else {
-            runCatching { native.SpiceKeyEvent(false, sc) }
+            runCatching { native.SpiceKeyEvent(false, mapping.scancode) }
+            if (syntheticAltGrHeld) {
+                syntheticAltGrHeld = false
+                SpiceKeycode.scancodeForKeyCode(KeyEvent.KEYCODE_ALT_RIGHT)?.let {
+                    runCatching { native.SpiceKeyEvent(false, it) }
+                }
+            }
             if (syntheticShiftHeld) {
                 syntheticShiftHeld = false
                 SpiceKeycode.scancodeForKeyCode(KeyEvent.KEYCODE_SHIFT_LEFT)?.let {
@@ -306,21 +369,26 @@ class SpiceClient(
         }
     }
 
+    /** See VncClient.blitToSurface's doc for the display-off backoff reasoning — identical here. */
     private fun blitToSurface() {
         val bmp = bitmap ?: return
         val surface = targetSurface ?: return
         if (!surface.isValid) return
+        val now = System.currentTimeMillis()
+        if (blitFailing && now - lastBlitAttemptMs < BLIT_RETRY_INTERVAL_MS) return
+        lastBlitAttemptMs = now
         synchronized(renderLock) {
             try {
-                val canvas = surface.lockCanvas(null) ?: return
+                val canvas = surface.lockCanvas(null) ?: run { blitFailing = true; return }
                 try {
                     val sw = canvas.width
                     val sh = canvas.height
                     val scale = minOf(sw.toFloat() / bmp.width, sh.toFloat() / bmp.height) * zoomScale
                     val dw = bmp.width * scale
                     val dh = bmp.height * scale
+                    // Top-anchored vertically, not centred — see VncClient.blitToSurface's doc.
                     val ox = (sw - dw) / 2f + panX
-                    val oy = (sh - dh) / 2f + panY
+                    val oy = 0f + panY
                     renderScale = scale
                     renderOffsetX = ox
                     renderOffsetY = oy
@@ -330,7 +398,9 @@ class SpiceClient(
                 } finally {
                     surface.unlockCanvasAndPost(canvas)
                 }
+                blitFailing = false
             } catch (e: Exception) {
+                blitFailing = true
                 Log.w(TAG, "blitToSurface failed: ${e.message}")
             }
         }

@@ -12,6 +12,9 @@ import com.freerdp.freerdpcore.services.LibFreeRDP
 import de.lobianco.saftssh.remotedesktop.SyntheticCursor
 
 private const val TAG = "RdpClient"
+// See blitToSurface's doc — how long to back off between retry attempts once lockCanvas() starts
+// failing (e.g. display asleep), instead of retrying on every single incoming server frame.
+private const val BLIT_RETRY_INTERVAL_MS = 2000L
 
 // RDP pointer-event flags (MS-RDPBCGR TS_POINTER_FLAG constants — stable protocol spec values,
 // verified against include/freerdp/input.h rather than assumed, since RDP's BUTTON1/2/3 numbering
@@ -83,6 +86,7 @@ class RdpClient(
     @Volatile private var bitmap: Bitmap? = null
     @Volatile private var connected = false
     private var thread: Thread? = null
+    @Volatile private var surfaceRefreshThread: Thread? = null
 
     @Volatile var targetSurface: Surface? = null
 
@@ -111,11 +115,35 @@ class RdpClient(
     // calling in on a pointer move (see VncClient for the same reasoning).
     private val renderLock = Any()
 
+    // See blitToSurface's doc — backoff state for when lockCanvas() is failing (e.g. display
+    // asleep: "dequeueBuffer failed", which surface.isValid does NOT catch).
+    @Volatile private var blitFailing = false
+    @Volatile private var lastBlitAttemptMs = 0L
+
     fun setZoom(scale: Float, newPanX: Float, newPanY: Float) {
         zoomScale = scale.coerceAtLeast(0.1f)
         panX = newPanX
         panY = newPanY
         blitToSurface() // reflect the new zoom immediately, even without a fresh server frame
+    }
+
+    /** Swaps in a fresh Surface mid-session, with retried re-blits across the resize settle window
+     *  — see VncClient.updateSurface's doc for the full reasoning (a single blit can race the
+     *  reallocating buffer during an IME/rotation resize and, on a static remote screen, leave the
+     *  view frozen with nothing to re-trigger a draw). */
+    fun updateSurface(surface: Surface) {
+        targetSurface = surface
+        // See VncClient.updateSurface's identical reset — a fresh Surface shouldn't inherit the
+        // old one's display-off backoff.
+        blitFailing = false
+        surfaceRefreshThread?.interrupt()
+        surfaceRefreshThread = Thread {
+            for (delayMs in longArrayOf(0, 60, 150, 300, 550)) {
+                try { Thread.sleep(delayMs) } catch (_: InterruptedException) { return@Thread }
+                if (targetSurface !== surface) return@Thread
+                blitToSurface()
+            }
+        }.apply { isDaemon = true; start() }
     }
 
     /** Throws if the connection parameters are rejected before the connect thread even starts
@@ -279,6 +307,12 @@ class RdpClient(
     }
 
     fun stop() {
+        // See VncClient.stop()'s doc for why this is cleared first, before any teardown call that
+        // might itself take a moment — a fast disconnect+reconnect (e.g. the connection-settings
+        // menu) can have a brand-new session's client already targeting the same reused Surface
+        // before this old session's teardown has fully unwound.
+        targetSurface = null
+        surfaceRefreshThread?.interrupt()
         runCatching { LibFreeRDP.disconnect(inst) }
         runCatching { LibFreeRDP.removeUIEventListener(inst) }
         runCatching { LibFreeRDP.freeInstance(inst) }
@@ -362,13 +396,17 @@ class RdpClient(
         }
     }
 
+    /** See VncClient.blitToSurface's doc for the display-off backoff reasoning — identical here. */
     private fun blitToSurface() {
         val bmp = bitmap ?: return
         val surface = targetSurface ?: return
         if (!surface.isValid) return
+        val now = System.currentTimeMillis()
+        if (blitFailing && now - lastBlitAttemptMs < BLIT_RETRY_INTERVAL_MS) return
+        lastBlitAttemptMs = now
         synchronized(renderLock) {
             try {
-                val canvas = surface.lockCanvas(null) ?: return
+                val canvas = surface.lockCanvas(null) ?: run { blitFailing = true; return }
                 try {
                     // Letterbox * zoom — see VncClient.blitToSurface for the identical reasoning.
                     val sw = canvas.width
@@ -376,8 +414,9 @@ class RdpClient(
                     val scale = minOf(sw.toFloat() / bmp.width, sh.toFloat() / bmp.height) * zoomScale
                     val dw = bmp.width * scale
                     val dh = bmp.height * scale
+                    // Top-anchored vertically, not centred — see VncClient.blitToSurface's doc.
                     val ox = (sw - dw) / 2f + panX
-                    val oy = (sh - dh) / 2f + panY
+                    val oy = 0f + panY
                     renderScale = scale
                     renderOffsetX = ox
                     renderOffsetY = oy
@@ -387,7 +426,9 @@ class RdpClient(
                 } finally {
                     surface.unlockCanvasAndPost(canvas)
                 }
+                blitFailing = false
             } catch (e: Exception) {
+                blitFailing = true
                 Log.w(TAG, "blitToSurface failed: ${e.message}")
             }
         }

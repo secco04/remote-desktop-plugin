@@ -19,6 +19,23 @@ import javax.crypto.Cipher
 import javax.crypto.spec.SecretKeySpec
 
 private const val TAG = "VncClient"
+// See blitToSurface's doc — how long to back off between retry attempts once lockCanvas() starts
+// failing (e.g. display asleep), instead of retrying on every single incoming server frame.
+private const val BLIT_RETRY_INTERVAL_MS = 2000L
+
+// X11 keysyms for the Shift modifier — sent/tracked so shifted characters actually come out
+// shifted on the server. See VncClient.sendKeyEvent's doc.
+private const val KEYSYM_SHIFT_L = 0xFFE1
+private const val KEYSYM_SHIFT_R = 0xFFE2
+// X11 keysyms (which equal ASCII in this range) that REQUIRE Shift on a US keyboard — the layout
+// QEMU's default VNC keymap reverse-maps our keysyms through. Sending e.g. keysym '!' (0x21) with
+// no Shift held relies on the server auto-synthesizing Shift, which QEMU/noVNC-style backends do
+// NOT reliably do for touch-style input (browser noVNC works precisely because it fakes the Shift
+// itself) — so we bracket these with an explicit Shift. See sendKeyEvent.
+private val SHIFTED_KEYSYMS: Set<Int> = buildSet {
+    addAll(0x41..0x5A) // A-Z
+    addAll("!\"#$%&()*+:<>?@^_{|}~".map { it.code })
+}
 
 // RFB encodings (RFC 6143 §7.6/§7.7). Negative numbers are "pseudo-encodings": not pixel data,
 // but a signal about cursor shape / desktop size / etc. Every mainstream server supports these.
@@ -77,6 +94,7 @@ class VncClient(
     @Volatile private var running = false
     @Volatile private var output: DataOutputStream? = null
     private var thread: Thread? = null
+    @Volatile private var surfaceRefreshThread: Thread? = null
 
     @Volatile var framebuffer: Bitmap? = null
         private set
@@ -124,15 +142,59 @@ class VncClient(
     // though the actual network transfer was fine.
     @Volatile private var lastCursorBlitMs = 0L
 
+    // Shift state for the synthetic-shift bracketing in sendKeyEvent. physicalShiftHeld tracks a
+    // Shift the IME/hardware actually sent (so we don't add a redundant one); syntheticShiftHeld is
+    // one WE pressed to type a shifted character that arrived with no Shift (the common soft-keyboard
+    // / commitText path), released again on that character's key-up.
+    @Volatile private var physicalShiftHeld = false
+    @Volatile private var syntheticShiftHeld = false
+
     // lockCanvas/unlockCanvasAndPost must not be entered from two threads at once (the protocol
     // thread after a framebuffer update, and a Binder thread on a pointer move) — serialise them.
     private val renderLock = Any()
+
+    // See blitToSurface's doc — backoff state for when lockCanvas() is failing (e.g. display
+    // asleep: "dequeueBuffer failed", which surface.isValid does NOT catch).
+    @Volatile private var blitFailing = false
+    @Volatile private var lastBlitAttemptMs = 0L
 
     fun setZoom(scale: Float, newPanX: Float, newPanY: Float) {
         zoomScale = scale.coerceAtLeast(0.1f)
         panX = newPanX
         panY = newPanY
         blitToSurface() // reflect the new zoom immediately, even without a fresh server frame
+    }
+
+    /** Swaps in a fresh Surface mid-session (the Surface is reallocated whenever the SurfaceView
+     *  resizes — IME show/hide via imePadding, rotation, or background→foreground) and redraws the
+     *  current framebuffer onto it, so the view shows the last frame right away instead of staying
+     *  black/frozen until the server pushes its next update.
+     *
+     *  Redraws are RETRIED across the resize's settle window, not done once: a SurfaceView resize
+     *  isn't instantaneous — the underlying buffer is reallocated over the ~animation duration, and
+     *  a lockCanvas() during that window throws ("blitToSurface failed: null"). A single blit here
+     *  can land inside that window and fail; and because VNC only re-blits when the SERVER pushes a
+     *  framebuffer update, a STATIC remote screen then has nothing to re-trigger a draw and stays
+     *  frozen forever (the reported "bring up the IME and the image freezes, never recovers" bug).
+     *  We already hold the framebuffer bitmap in memory, so re-blitting needs no server round-trip
+     *  — just retry until one lands on the stabilised surface. */
+    fun updateSurface(surface: Surface) {
+        targetSurface = surface
+        // A fresh Surface is a new opportunity, not a continuation of whatever was failing before
+        // (e.g. the old Surface dying) — reset the backoff so the settle-window retries below run
+        // at their intended tight cadence instead of being suppressed by blitToSurface's own
+        // display-off backoff (see that method's doc for why the two would otherwise fight).
+        blitFailing = false
+        surfaceRefreshThread?.interrupt()
+        surfaceRefreshThread = Thread {
+            for (delayMs in longArrayOf(0, 60, 150, 300, 550)) {
+                try { Thread.sleep(delayMs) } catch (_: InterruptedException) { return@Thread }
+                // Abandon if a newer updateSurface() superseded this one, or stop() nulled the
+                // surface — targetSurface is the single source of truth for "what to draw onto".
+                if (targetSurface !== surface) return@Thread
+                blitToSurface()
+            }
+        }.apply { isDaemon = true; start() }
     }
 
     fun start() {
@@ -143,6 +205,18 @@ class VncClient(
 
     fun stop() {
         running = false
+        // Cleared BEFORE closing the socket/WebSocket, not after — destroy() on the AIDL side is
+        // oneway (see IRemoteDesktopSession.destroy's doc for why: a blocking teardown call ANR'd
+        // the caller), so the main app's disconnect()+immediate-reconnect (e.g. changing the
+        // connection-settings menu's Quality) can have a NEW session's createSession() land on this
+        // plugin process before this old session's background thread has actually unwound. Both
+        // instances would otherwise briefly hold the SAME Surface (a reconnect reuses it — no fresh
+        // surfaceChanged() fires) and could call lockCanvas()/unlockCanvasAndPost() concurrently
+        // from two different threads, which isn't safe. Nulling this first means blitToSurface()
+        // (called from both the protocol thread and any in-flight input-thread pointer move) turns
+        // into a no-op immediately, before the socket teardown that can itself take a moment.
+        targetSurface = null
+        surfaceRefreshThread?.interrupt()
         runCatching { socket?.close() }
         runCatching { proxmoxWs?.close() }
         thread?.interrupt()
@@ -205,9 +279,42 @@ class VncClient(
     }
 
     /** RFB KeyEvent (message type 4). [keysym] is an X11 keysym, not an Android keyCode — see
-     *  [AndroidKeysym.map]. */
+     *  [AndroidKeysym.map].
+     *
+     *  Brackets shifted characters with an explicit Shift press/release when one isn't already
+     *  held. The vast majority of characters reach us via the IME's commitText path (see
+     *  RemoteDesktopScreen's InputConnection), which delivers the final character keysym (e.g. '!')
+     *  with NO accompanying Shift key event. Sending that bare keysym relies on the VNC server
+     *  auto-synthesizing Shift from its keymap — which QEMU/noVNC-style backends do NOT reliably do
+     *  for this style of input, so shifted symbols ('!', '@', …) and uppercase silently failed while
+     *  lowercase/digits worked. Browser noVNC works precisely because it fakes the Shift itself for
+     *  touch input; this mirrors that. A real Shift the IME/hardware does send is tracked so we
+     *  never stack a second one on top. */
     fun sendKeyEvent(keysym: Int, down: Boolean) {
         if (keysym == 0) return
+        if (keysym == KEYSYM_SHIFT_L || keysym == KEYSYM_SHIFT_R) {
+            physicalShiftHeld = down
+            writeKeyEvent(keysym, down)
+            return
+        }
+        val needsShift = keysym in SHIFTED_KEYSYMS
+        if (down) {
+            if (needsShift && !physicalShiftHeld && !syntheticShiftHeld) {
+                syntheticShiftHeld = true
+                writeKeyEvent(KEYSYM_SHIFT_L, true)
+            }
+            writeKeyEvent(keysym, true)
+        } else {
+            writeKeyEvent(keysym, false)
+            if (syntheticShiftHeld) {
+                syntheticShiftHeld = false
+                writeKeyEvent(KEYSYM_SHIFT_L, false)
+            }
+        }
+    }
+
+    /** Raw RFB KeyEvent wire write — no shift logic (see [sendKeyEvent] for that). */
+    private fun writeKeyEvent(keysym: Int, down: Boolean) {
         val out = output ?: return
         try {
             synchronized(out) {
@@ -535,13 +642,26 @@ class VncClient(
         }
     }
 
+    /** Draws the current framebuffer onto [targetSurface]. Backs off after a failed lockCanvas()
+     *  instead of retrying on every single incoming server frame — turning the display off does
+     *  NOT reliably destroy/reallocate a SurfaceView's Surface (unlike backgrounding the app, which
+     *  does and fires surfaceChanged), so [Surface.isValid] keeps reporting true while the native
+     *  buffer-queue consumer is actually gone; every attempt then fails at the native layer with
+     *  "dequeueBuffer failed (No such device)" before our own try/catch even sees a Kotlin
+     *  exception. Retrying on every server-pushed frame (potentially dozens/sec) burns CPU/battery
+     *  and floods logcat for as long as the screen stays off — confirmed on-device. Capping retries
+     *  to once per [BLIT_RETRY_INTERVAL_MS] bounds that cost while staying self-healing: the very
+     *  next attempt after the display wakes up just succeeds normally, no callback dependency. */
     private fun blitToSurface() {
         val fb = framebuffer ?: return
         val surface = targetSurface ?: return
         if (!surface.isValid) return
+        val now = System.currentTimeMillis()
+        if (blitFailing && now - lastBlitAttemptMs < BLIT_RETRY_INTERVAL_MS) return
+        lastBlitAttemptMs = now
         synchronized(renderLock) {
             try {
-                val canvas = surface.lockCanvas(null) ?: return
+                val canvas = surface.lockCanvas(null) ?: run { blitFailing = true; return }
                 try {
                     // Base letterbox fit (aspect-preserving, centred) * pinch-zoom on top. The
                     // combined scale/offset are stored for sendPointerEvent's inverse mapping.
@@ -550,8 +670,14 @@ class VncClient(
                     val scale = minOf(sw.toFloat() / fb.width, sh.toFloat() / fb.height) * zoomScale
                     val dw = fb.width * scale
                     val dh = fb.height * scale
+                    // Horizontally centred (letterboxing left/right is unavoidable when the aspect
+                    // ratios differ), but TOP-anchored vertically rather than centred — the Surface
+                    // this draws onto already starts right below the top bar/control strip (see
+                    // RemoteDesktopScreen's topBarHeight padding), so vertically centring on top of
+                    // that just pushed the remote screen further down with a dead gap above it. Not
+                    // "0f" directly so pinch-zoom's panY still applies on top.
                     val ox = (sw - dw) / 2f + panX
-                    val oy = (sh - dh) / 2f + panY
+                    val oy = 0f + panY
                     renderScale = scale
                     renderOffsetX = ox
                     renderOffsetY = oy
@@ -573,7 +699,9 @@ class VncClient(
                 } finally {
                     surface.unlockCanvasAndPost(canvas)
                 }
+                blitFailing = false
             } catch (e: Exception) {
+                blitFailing = true
                 Log.w(TAG, "blitToSurface failed: ${e.message}")
             }
         }
