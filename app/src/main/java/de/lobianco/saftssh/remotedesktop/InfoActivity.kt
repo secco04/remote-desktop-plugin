@@ -9,8 +9,10 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
+import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 
 /** Minimal launcher activity so the APK is launchable/Play-Store-acceptable — the plugin works
  *  entirely as a bound service, same pattern as the Linux Plugin's InfoActivity. */
@@ -77,6 +79,25 @@ class InfoActivity : Activity() {
             setLineSpacing(8f, 1f)
         }
 
+        // Opening this Activity is also the fix for a real Android platform restriction: a
+        // freshly installed/updated app starts in a "stopped" state in which NO other app may
+        // bindService() into it (ApplicationInfo.FLAG_STOPPED) — LobiShell's own bind attempt then
+        // fails with a raw "Not allowed to bind to service" SecurityException until this Activity
+        // is opened at least once. Same button as the Linux Plugin's InfoActivity, for the same
+        // reason.
+        val openAppButton = Button(this).apply {
+            text = "Open LobiShell"
+            setPadding(0, 24, 0, 0)
+            setOnClickListener {
+                val launchIntent = packageManager.getLaunchIntentForPackage("de.lobianco.saftssh")
+                if (launchIntent != null) {
+                    startActivity(launchIntent)
+                } else {
+                    Toast.makeText(this@InfoActivity, "LobiShell isn't installed", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+
         val badge = TextView(this).apply {
             text = "PLUGIN COMPONENT"
             textSize = 12f
@@ -89,6 +110,7 @@ class InfoActivity : Activity() {
         card.addView(title)
         card.addView(subtitle)
         card.addView(description)
+        card.addView(openAppButton)
         card.addView(badge)
 
         root.addView(
