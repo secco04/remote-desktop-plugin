@@ -235,7 +235,15 @@ class SpiceClient(
 
     override fun onSettingsChanged(width: Int, height: Int, bpp: Int) {
         Log.i(TAG, "onSettingsChanged: ${width}x$height @${bpp}bpp")
-        bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        // SPICE's primary surface is BGRX (native UpdateBitmap does the BGRX->RGBA swizzle) — the
+        // X byte is unused padding, not a real alpha channel, and libspice writes it as 0x00. Left
+        // alone, ARGB_8888's default hasAlpha=true reads that 0x00 as fully transparent, so every
+        // pixel composites as invisible over blitToSurface's black background: cursor and input
+        // still work (SyntheticCursor draws straight onto the canvas, not through this bitmap) but
+        // no actual picture ever appears. setHasAlpha(false) makes the canvas ignore that byte and
+        // treat every pixel as opaque, matching what VncClient's manual pixel decode already does
+        // explicitly (see its "opaque ARGB_8888 int" comment).
+        bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).apply { setHasAlpha(false) }
         pointerFbX = width / 2
         pointerFbY = height / 2
         if (!connected) {
