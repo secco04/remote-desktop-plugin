@@ -1,4 +1,4 @@
-# LobiShell Remote Desktop Plugin
+# Remote Desktop Plugin for LobiShell
 
 This is a **standalone Android project** — open `remote-desktop-plugin/` as its own Android
 Studio project. It is NOT a module of the main LobiShell app.

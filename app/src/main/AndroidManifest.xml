@@ -16,7 +16,7 @@
     </queries>
 
     <application
-        android:label="LobiShell Remote Desktop Plugin"
+        android:label="Remote Desktop Plugin for LobiShell"
         android:allowBackup="false"
         android:supportsRtl="true"
         android:icon="@mipmap/ic_launcher">
