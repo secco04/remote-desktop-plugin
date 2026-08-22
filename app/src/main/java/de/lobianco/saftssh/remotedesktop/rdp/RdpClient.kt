@@ -266,11 +266,11 @@ class RdpClient(
             override fun OnPreConnect(instance: Long) { onProgress("Negotiating…") }
             override fun OnConnectionSuccess(instance: Long) { /* graphics arrive via OnGraphicsResize */ }
             override fun OnConnectionFailure(instance: Long) {
-                onDisconnected("Connection failed — check host/port/credentials")
+                onDisconnected(lastErrorReason(instance, "Connection failed — check host/port/credentials"))
             }
             override fun OnDisconnecting(instance: Long) {}
             override fun OnDisconnected(instance: Long) {
-                if (connected) onDisconnected("Disconnected")
+                if (connected) onDisconnected(lastErrorReason(instance, "Disconnected"))
             }
         })
 
@@ -278,8 +278,20 @@ class RdpClient(
         // client's own message loop internally) — same reasoning as VncClient's own thread.
         thread = Thread({
             val success = LibFreeRDP.connect(inst)
-            if (!success) onDisconnected("Connection failed")
+            if (!success) onDisconnected(lastErrorReason(inst, "Connection failed"))
         }, "RdpClient-$host:$port").apply { isDaemon = true; start() }
+    }
+
+    /**
+     * FreeRDP's own reason for the last connect/disconnect failure — distinguishes an NLA/CredSSP
+     * negotiation failure from a rejected password from a network timeout, none of which were
+     * told apart before (every failure surfaced as the same generic string regardless of cause).
+     * Falls back to [fallback] when the native call is unavailable or returns nothing useful, so a
+     * missing reason never leaves the user with a blank message.
+     */
+    private fun lastErrorReason(instance: Long, fallback: String): String {
+        val native = runCatching { LibFreeRDP.getLastErrorString(instance) }.getOrNull()
+        return if (native.isNullOrBlank()) fallback else "$fallback ($native)"
     }
 
     /** (Re)allocates the framebuffer bitmap the native GDI buffer is copied into. Always

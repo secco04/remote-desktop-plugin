@@ -150,6 +150,22 @@ public class LibFreeRDP
 
 	private static native String freerdp_get_last_error_string(long inst);
 
+	/** Public wrapper — FreeRDP's own human-readable reason for the last connect/disconnect
+	 *  failure (e.g. distinguishes an NLA/CredSSP negotiation failure from a bad password from a
+	 *  network timeout), previously declared but never called: every failure surfaced to the user
+	 *  as the same generic "Connection failed" regardless of cause. */
+	public static String getLastErrorString(long inst)
+	{
+		try
+		{
+			return freerdp_get_last_error_string(inst);
+		}
+		catch (Exception e)
+		{
+			return null;
+		}
+	}
+
 	public static void setEventListener(EventListener l)
 	{
 		listener = l;
