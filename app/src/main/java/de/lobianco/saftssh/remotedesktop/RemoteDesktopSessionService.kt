@@ -9,7 +9,7 @@ import android.content.Intent
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
-import android.util.Log
+import de.lobianco.saftssh.remotedesktop.data.logging.AppLog
 import android.view.Surface
 import de.lobianco.saftssh.remotedesktop.rdp.RdpCertStore
 import de.lobianco.saftssh.remotedesktop.rdp.RdpClient
@@ -72,7 +72,7 @@ class RemoteDesktopSessionService : Service() {
         val callerPackages = packageManager.getPackagesForUid(callingUid) ?: arrayOf()
         val authorized = callerPackages.any { it in ALLOWED_CALLER_PACKAGES }
         if (!authorized) {
-            Log.w(TAG, "Rejected call from unauthorized caller uid=$callingUid packages=${callerPackages.joinToString()}")
+            AppLog.w(TAG, "Rejected call from unauthorized caller uid=$callingUid packages=${callerPackages.joinToString()}")
         }
         return authorized
     }
@@ -153,7 +153,7 @@ class RemoteDesktopSessionService : Service() {
                 )
                 openSessions.add(session)
                 promoteToForeground()
-                Log.i(TAG, "createSession: protocol=$protocol host=$host:$port fast=$fastQuality override=${overrideWidth}x$overrideHeight")
+                AppLog.i(TAG, "createSession: protocol=$protocol host=$host:$port fast=$fastQuality override=${overrideWidth}x$overrideHeight")
                 session
             } catch (e: Throwable) {
                 // Throwable, not Exception: a native library failing to load (e.g. libspice.so /
@@ -161,7 +161,7 @@ class RemoteDesktopSessionService : Service() {
                 // far) throws UnsatisfiedLinkError, an Error subtype that a plain `catch (Exception)`
                 // would let propagate straight past this AIDL Binder call and likely kill the whole
                 // plugin process instead of just reporting a clean connection failure.
-                Log.e(TAG, "createSession failed", e)
+                AppLog.e(TAG, "createSession failed", e)
                 runCatching { callback?.onProgress("Error: ${e.message}") }
                 null
             }
@@ -171,7 +171,7 @@ class RemoteDesktopSessionService : Service() {
             if (!isCallerAuthorized()) return
             if (host == null || fingerprint == null) return
             RdpCertStore(this@RemoteDesktopSessionService).trust(host, port, fingerprint)
-            Log.i(TAG, "Trusted RDP certificate for $host:$port")
+            AppLog.i(TAG, "Trusted RDP certificate for $host:$port")
         }
     }
 
@@ -197,7 +197,7 @@ class RemoteDesktopSessionService : Service() {
                     onProgress = { line -> runCatching { callback?.onProgress(line) } },
                     onConnected = { w, h ->
                         runCatching { callback?.onConnected() }
-                        Log.i(TAG, "VNC connected: ${w}x$h")
+                        AppLog.i(TAG, "VNC connected: ${w}x$h")
                     },
                     onDisconnected = { reason ->
                         runCatching { callback?.onDisconnected(reason) }
@@ -234,7 +234,7 @@ class RemoteDesktopSessionService : Service() {
                     onProgress = { line -> runCatching { callback?.onProgress(line) } },
                     onConnected = { w, h ->
                         runCatching { callback?.onConnected() }
-                        Log.i(TAG, "RDP connected: ${w}x$h")
+                        AppLog.i(TAG, "RDP connected: ${w}x$h")
                     },
                     onDisconnected = { reason ->
                         runCatching { callback?.onDisconnected(reason) }
@@ -264,7 +264,7 @@ class RemoteDesktopSessionService : Service() {
                     onProgress = { line -> runCatching { callback?.onProgress(line) } },
                     onConnected = { w, h ->
                         runCatching { callback?.onConnected() }
-                        Log.i(TAG, "SPICE connected: ${w}x$h")
+                        AppLog.i(TAG, "SPICE connected: ${w}x$h")
                     },
                     onDisconnected = { reason ->
                         runCatching { callback?.onDisconnected(reason) }
@@ -325,7 +325,7 @@ class RemoteDesktopSessionService : Service() {
                 rdpClient?.updateSurface(surface)
                 spiceClient?.updateSurface(surface)
             } catch (e: Exception) {
-                Log.w(TAG, "updateSurface handling failed", e)
+                AppLog.w(TAG, "updateSurface handling failed", e)
             }
         }
 
@@ -341,14 +341,14 @@ class RemoteDesktopSessionService : Service() {
         override fun sendPointerEvent(x: Int, y: Int, buttonMask: Int) {
             if (!loggedFirstPointer) {
                 loggedFirstPointer = true
-                Log.i(TAG, "First pointer event reached plugin: ($x,$y) mask=$buttonMask vnc=${vncClient != null} rdp=${rdpClient != null} spice=${spiceClient != null}")
+                AppLog.i(TAG, "First pointer event reached plugin: ($x,$y) mask=$buttonMask vnc=${vncClient != null} rdp=${rdpClient != null} spice=${spiceClient != null}")
             }
             try {
                 vncClient?.sendPointerEvent(x, y, buttonMask)
                 rdpClient?.sendPointerEvent(x, y, buttonMask)
                 spiceClient?.sendPointerEvent(x, y, buttonMask)
             } catch (e: Exception) {
-                Log.w(TAG, "sendPointerEvent handling failed", e)
+                AppLog.w(TAG, "sendPointerEvent handling failed", e)
             }
         }
 
@@ -358,7 +358,7 @@ class RemoteDesktopSessionService : Service() {
                 rdpClient?.setZoom(scale, panX, panY)
                 spiceClient?.setZoom(scale, panX, panY)
             } catch (e: Exception) {
-                Log.w(TAG, "setZoom handling failed", e)
+                AppLog.w(TAG, "setZoom handling failed", e)
             }
         }
 
@@ -368,21 +368,21 @@ class RemoteDesktopSessionService : Service() {
                 rdpClient?.sendScroll(steps)
                 spiceClient?.sendScroll(steps)
             } catch (e: Exception) {
-                Log.w(TAG, "sendScroll handling failed", e)
+                AppLog.w(TAG, "sendScroll handling failed", e)
             }
         }
 
         override fun sendKeyEvent(keyCode: Int, unicodeChar: Int, down: Boolean, metaState: Int) {
             if (!loggedFirstKey) {
                 loggedFirstKey = true
-                Log.i(TAG, "First key event reached plugin: keyCode=$keyCode unicode=$unicodeChar down=$down")
+                AppLog.i(TAG, "First key event reached plugin: keyCode=$keyCode unicode=$unicodeChar down=$down")
             }
             try {
                 vncClient?.let { it.sendKeyEvent(AndroidKeysym.map(keyCode, unicodeChar), down) }
                 rdpClient?.sendKeyEvent(keyCode, unicodeChar, down)
                 spiceClient?.sendKeyEvent(keyCode, unicodeChar, down)
             } catch (e: Exception) {
-                Log.w(TAG, "sendKeyEvent handling failed", e)
+                AppLog.w(TAG, "sendKeyEvent handling failed", e)
             }
         }
 
@@ -434,10 +434,10 @@ class RemoteDesktopSessionService : Service() {
                     // to actually flush before the process disappears out from under them.
                     Thread.sleep(300)
                     if (openSessions.isEmpty()) {
-                        Log.i(TAG, "Restarting plugin process after a SPICE session (see destroyInternal's doc)")
+                        AppLog.i(TAG, "Restarting plugin process after a SPICE session (see destroyInternal's doc)")
                         android.os.Process.killProcess(android.os.Process.myPid())
                     } else {
-                        Log.i(TAG, "Skipping scheduled process restart — a new session started during the grace window")
+                        AppLog.i(TAG, "Skipping scheduled process restart — a new session started during the grace window")
                     }
                 }, "SpiceProcessRestart").apply { isDaemon = true; start() }
             }

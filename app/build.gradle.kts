@@ -29,8 +29,8 @@ android {
         applicationId = "de.lobianco.saftssh.remotedesktop"
         minSdk = 26
         targetSdk = 37
-        versionCode = 16
-        versionName = "0.16"
+        versionCode = 17
+        versionName = "0.17"
     }
 
     buildFeatures {
@@ -99,4 +99,9 @@ dependencies {
     // dependency this needs; pure Kotlin/Java, no native code, negligible size next to the SPICE
     // native libs already bundled.
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // FileProvider (data/logging + Submit Logs' ACTION_SEND share sheet) — this module had no
+    // AndroidX dependency at all before that was added, so androidx.core.content.FileProvider
+    // was an unresolved reference until this was declared.
+    implementation("androidx.core:core-ktx:1.19.0")
 }

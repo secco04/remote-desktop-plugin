@@ -5,7 +5,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Rect
 import android.graphics.RectF
-import android.util.Log
+import de.lobianco.saftssh.remotedesktop.data.logging.AppLog
 import android.view.Surface
 import de.lobianco.saftssh.remotedesktop.SyntheticCursor
 import java.io.BufferedInputStream
@@ -245,7 +245,7 @@ class VncClient(
                 out.flush()
             }
         } catch (e: IOException) {
-            Log.w(TAG, "sendPointerEvent failed: ${e.message}")
+            AppLog.w(TAG, "sendPointerEvent failed: ${e.message}")
         }
         // The server won't push a frame just because our locally-drawn cursor moved — redraw so
         // the cursor tracks the finger smoothly between real framebuffer updates. Throttled (see
@@ -274,7 +274,7 @@ class VncClient(
                 out.flush()
             }
         } catch (e: IOException) {
-            Log.w(TAG, "sendScroll failed: ${e.message}")
+            AppLog.w(TAG, "sendScroll failed: ${e.message}")
         }
     }
 
@@ -325,7 +325,7 @@ class VncClient(
                 out.flush()
             }
         } catch (e: IOException) {
-            Log.w(TAG, "sendKeyEvent failed: ${e.message}")
+            AppLog.w(TAG, "sendKeyEvent failed: ${e.message}")
         }
     }
 
@@ -400,7 +400,7 @@ class VncClient(
             }
         } catch (e: Exception) {
             if (running) {
-                Log.w(TAG, "VNC session ended: ${e.message}", e)
+                AppLog.w(TAG, "VNC session ended: ${e.message}", e)
                 onDisconnected(e.message ?: e.javaClass.simpleName)
             }
         } finally {
@@ -412,7 +412,7 @@ class VncClient(
 
     private fun negotiateVersion(inp: DataInputStream, out: DataOutputStream) {
         val serverVersion = ByteArray(12).also { inp.readFully(it) }
-        Log.i(TAG, "Server version: ${String(serverVersion).trim()}")
+        AppLog.i(TAG, "Server version: ${String(serverVersion).trim()}")
         out.write("RFB 003.008\n".toByteArray())
         out.flush()
     }
@@ -485,7 +485,7 @@ class VncClient(
         inp.skipBytes(16) // server PIXEL_FORMAT — overridden below
         val nameLen = inp.readInt()
         val name = ByteArray(nameLen).also { inp.readFully(it) }
-        Log.i(TAG, "ServerInit: ${width}x$height name=${String(name)}")
+        AppLog.i(TAG, "ServerInit: ${width}x$height name=${String(name)}")
 
         // SetPixelFormat. Balanced (default): 32-bit true-colour, byte order matching
         // ARGB_8888's in-memory layout so Raw rectangles copy straight into the Bitmap with no
@@ -630,7 +630,7 @@ class VncClient(
                 ENCODING_DESKTOP_SIZE -> {
                     // No pixel data — w/h are the new full framebuffer size. Reallocate; the next
                     // blit's letterbox fit picks up the new aspect ratio automatically.
-                    Log.i(TAG, "DesktopSize changed: ${fbWidth}x$fbHeight -> ${w}x$h")
+                    AppLog.i(TAG, "DesktopSize changed: ${fbWidth}x$fbHeight -> ${w}x$h")
                     fbWidth = w
                     fbHeight = h
                     pointerFbX = pointerFbX.coerceIn(0, w - 1)
@@ -702,7 +702,7 @@ class VncClient(
                 blitFailing = false
             } catch (e: Exception) {
                 blitFailing = true
-                Log.w(TAG, "blitToSurface failed: ${e.message}")
+                AppLog.w(TAG, "blitToSurface failed: ${e.message}")
             }
         }
     }

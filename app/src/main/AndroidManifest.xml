@@ -16,6 +16,7 @@
     </queries>
 
     <application
+        android:name=".RemoteDesktopPluginApplication"
         android:label="Remote Desktop Plugin for LobiShell"
         android:allowBackup="false"
         android:supportsRtl="true"
@@ -44,6 +45,17 @@
                 <action android:name="de.lobianco.saftssh.remotedesktop.BIND_SESSION_SERVICE" />
             </intent-filter>
         </service>
+
+        <!-- Exposes filesDir/logs/*.log to the share sheet for "Submit Logs" (InfoActivity). -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="de.lobianco.saftssh.remotedesktop.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
     </application>
 

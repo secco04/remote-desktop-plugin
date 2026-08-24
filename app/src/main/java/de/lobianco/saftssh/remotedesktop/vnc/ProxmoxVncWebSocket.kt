@@ -1,6 +1,6 @@
 package de.lobianco.saftssh.remotedesktop.vnc
 
-import android.util.Log
+import de.lobianco.saftssh.remotedesktop.data.logging.AppLog
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -92,7 +92,7 @@ class ProxmoxVncWebSocket(
                 incoming.put(text.toByteArray(Charsets.UTF_8))
             }
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                Log.w(TAG, "WebSocket failure: ${t.message}", t)
+                AppLog.w(TAG, "WebSocket failure: ${t.message}", t)
                 failure = t
                 closed = true
                 openLatch.countDown()

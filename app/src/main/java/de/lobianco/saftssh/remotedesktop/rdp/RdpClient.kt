@@ -5,7 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.RectF
 import android.net.Uri
-import android.util.Log
+import de.lobianco.saftssh.remotedesktop.data.logging.AppLog
 import android.view.KeyEvent
 import android.view.Surface
 import com.freerdp.freerdpcore.services.LibFreeRDP
@@ -164,7 +164,7 @@ class RdpClient(
                 // (android_desktop_resize), so relying on it left the initial connect with no
                 // bitmap and a permanently blank screen. Confirmed against the actual native
                 // source + the reference SessionActivity, not guessed.
-                Log.i(TAG, "OnSettingsChanged: ${width}x$height @${bpp}bpp")
+                AppLog.i(TAG, "OnSettingsChanged: ${width}x$height @${bpp}bpp")
                 allocateFramebuffer(width, height)
                 pointerFbX = width / 2
                 pointerFbY = height / 2
@@ -219,7 +219,7 @@ class RdpClient(
             override fun OnGraphicsResize(width: Int, height: Int, bpp: Int) {
                 // Later server-initiated desktop resize only — replace the bitmap with the new
                 // size. Initial allocation happens in OnSettingsChanged (see there).
-                Log.i(TAG, "OnGraphicsResize: ${width}x$height @${bpp}bpp")
+                AppLog.i(TAG, "OnGraphicsResize: ${width}x$height @${bpp}bpp")
                 allocateFramebuffer(width, height)
             }
 
@@ -308,7 +308,7 @@ class RdpClient(
     private fun decideCertificateTrust(fingerprint: String?): Int {
         val fp = fingerprint ?: return 0
         if (certStore.isTrusted(host, port, fp)) return 1
-        Log.w(TAG, "Untrusted RDP certificate for $host:$port (fingerprint=$fp) — rejecting, awaiting user confirmation")
+        AppLog.w(TAG, "Untrusted RDP certificate for $host:$port (fingerprint=$fp) — rejecting, awaiting user confirmation")
         onProgress("CERT_UNTRUSTED|$host|$port|$fp")
         return 0
     }
@@ -361,8 +361,8 @@ class RdpClient(
         }
         lastButtonFlag = currentFlag
         runCatching { LibFreeRDP.sendCursorEvent(inst, mx, my, flags) }
-            .onSuccess { ok -> if (buttonMask != 0 || currentFlag != 0) Log.i(TAG, "sendCursorEvent($mx,$my,flags=0x${flags.toString(16)}) inst=$inst connected=$connected -> $ok") }
-            .onFailure { e -> Log.w(TAG, "sendCursorEvent threw", e) }
+            .onSuccess { ok -> if (buttonMask != 0 || currentFlag != 0) AppLog.i(TAG, "sendCursorEvent($mx,$my,flags=0x${flags.toString(16)}) inst=$inst connected=$connected -> $ok") }
+            .onFailure { e -> AppLog.w(TAG, "sendCursorEvent threw", e) }
         // Redraw so the synthetic cursor tracks the pointer between server frames. Throttled (see
         // lastCursorBlitMs's doc) so a fast drag can't starve real protocol-driven redraws.
         val now = System.currentTimeMillis()
@@ -441,7 +441,7 @@ class RdpClient(
                 blitFailing = false
             } catch (e: Exception) {
                 blitFailing = true
-                Log.w(TAG, "blitToSurface failed: ${e.message}")
+                AppLog.w(TAG, "blitToSurface failed: ${e.message}")
             }
         }
     }

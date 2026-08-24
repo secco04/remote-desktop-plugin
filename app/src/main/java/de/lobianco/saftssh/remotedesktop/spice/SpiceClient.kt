@@ -4,7 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.RectF
-import android.util.Log
+import de.lobianco.saftssh.remotedesktop.data.logging.AppLog
 import android.view.KeyEvent
 import android.view.Surface
 import com.undatech.opaque.SpiceCommunicator
@@ -179,7 +179,7 @@ class SpiceClient(
                     native.SpiceClientConnect(host, port.toString(), "", password.orEmpty(), null, null, null, false)
                 }
             }
-            Log.i(TAG, "Spice connect returned: $result")
+            AppLog.i(TAG, "Spice connect returned: $result")
             runCatching { vvFile?.delete() } // belt-and-suspenders — see writeVvFile's doc
             SpiceCommunicator.detach(this)
             onDisconnected(if (connected) "Disconnected" else "Connection failed — check host/port")
@@ -234,7 +234,7 @@ class SpiceClient(
     // not the thread that called start() (see android-service.c's attachThreadToJvm). ──
 
     override fun onSettingsChanged(width: Int, height: Int, bpp: Int) {
-        Log.i(TAG, "onSettingsChanged: ${width}x$height @${bpp}bpp")
+        AppLog.i(TAG, "onSettingsChanged: ${width}x$height @${bpp}bpp")
         // SPICE's primary surface is BGRX (native UpdateBitmap does the BGRX->RGBA swizzle) — the
         // X byte is unused padding, not a real alpha channel, and libspice writes it as 0x00. Left
         // alone, ARGB_8888's default hasAlpha=true reads that 0x00 as fully transparent, so every
@@ -267,11 +267,11 @@ class SpiceClient(
 
     override fun onMouseMode(relative: Boolean) {
         relativeMode = relative
-        if (relative) Log.w(TAG, "Server switched to relative mouse mode — input won't work (see class doc)")
+        if (relative) AppLog.w(TAG, "Server switched to relative mouse mode — input won't work (see class doc)")
     }
 
     override fun onShowMessage(message: String) {
-        Log.i(TAG, "ShowMessage: $message")
+        AppLog.i(TAG, "ShowMessage: $message")
     }
 
     override fun onRemoteClipboardChanged(data: String) {
@@ -409,7 +409,7 @@ class SpiceClient(
                 blitFailing = false
             } catch (e: Exception) {
                 blitFailing = true
-                Log.w(TAG, "blitToSurface failed: ${e.message}")
+                AppLog.w(TAG, "blitToSurface failed: ${e.message}")
             }
         }
     }
