@@ -118,6 +118,7 @@ class InfoActivity : Activity() {
                         android.content.Intent.createChooser(
                             android.content.Intent(android.content.Intent.ACTION_SEND).apply {
                                 type = "text/plain"
+                                putExtra(android.content.Intent.EXTRA_EMAIL, arrayOf("feedback@lobishell.lobianco.de"))
                                 putExtra(android.content.Intent.EXTRA_STREAM, uri)
                                 addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
                             },
