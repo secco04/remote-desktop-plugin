@@ -139,6 +139,7 @@ class RemoteDesktopSessionService : Service() {
             fastQuality: Boolean, overrideWidth: Int, overrideHeight: Int,
             tlsPort: Int, proxy: String?, caCert: String?, hostSubject: String?,
             vncWsUrl: String?, vncWsCookie: String?, keyboardLayout: String?,
+            networkPreset: String?, soundEnabled: Boolean, udpEnabled: Boolean,
         ): IRemoteDesktopSession? {
             if (!isCallerAuthorized()) return null
             return try {
@@ -150,6 +151,7 @@ class RemoteDesktopSessionService : Service() {
                     fastQuality, overrideWidth, overrideHeight,
                     tlsPort, proxy, caCert, hostSubject,
                     vncWsUrl, vncWsCookie, keyboardLayout,
+                    networkPreset, soundEnabled, udpEnabled,
                 )
                 openSessions.add(session)
                 promoteToForeground()
@@ -184,6 +186,7 @@ class RemoteDesktopSessionService : Service() {
         fastQuality: Boolean, overrideWidth: Int, overrideHeight: Int,
         tlsPort: Int, proxy: String?, caCert: String?, hostSubject: String?,
         vncWsUrl: String?, vncWsCookie: String?, keyboardLayout: String?,
+        networkPreset: String?, soundEnabled: Boolean, udpEnabled: Boolean,
     ): SessionImpl {
         val session = SessionImpl()
         when (protocol) {
@@ -231,6 +234,9 @@ class RemoteDesktopSessionService : Service() {
                     initialWidth = requestedWidth,
                     initialHeight = requestedHeight,
                     fastQuality = fastQuality,
+                    networkPreset = networkPreset,
+                    soundEnabled = soundEnabled,
+                    udpEnabled = udpEnabled,
                     onProgress = { line -> runCatching { callback?.onProgress(line) } },
                     onConnected = { w, h ->
                         runCatching { callback?.onConnected() }

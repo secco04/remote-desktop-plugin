@@ -77,6 +77,18 @@ class RdpClient(
      *  the session's lifetime — FreeRDP negotiates colour depth once at connect, so changing this
      *  means reconnecting (see IRemoteDesktopSessionService.createSession's doc). */
     private val fastQuality: Boolean = false,
+    /** FreeRDP's own "/network:" performance preset ("lan"/"auto"/"modem") — see
+     *  IRemoteDesktopSessionService.createSession's doc for the full reasoning. Null/blank leaves
+     *  it unset (FreeRDP's own default). */
+    private val networkPreset: String? = null,
+    /** Redirects the remote's system audio to this device — see IRemoteDesktopSessionService.
+     *  createSession's [soundEnabled] doc for why this is binary on/off only, fixed for the
+     *  session's lifetime same as [fastQuality]. */
+    private val soundEnabled: Boolean = false,
+    /** FreeRDP's "/multitransport" (MS-RDPEMT) flag — see IRemoteDesktopSessionService.
+     *  createSession's [udpEnabled] doc; safe to always request, FreeRDP falls back to TCP-only
+     *  on its own if the server/network doesn't support it. */
+    private val udpEnabled: Boolean = false,
     private val onProgress: (String) -> Unit,
     private val onConnected: (width: Int, height: Int) -> Unit,
     private val onDisconnected: (reason: String) -> Unit,
@@ -252,7 +264,13 @@ class RdpClient(
             .appendQueryParameter("bpp", bppParam)
             .appendQueryParameter("clipboard", "")
             .appendQueryParameter("sec", "nla") // most modern Windows hosts require NLA by default
+            // Lossless bulk (zlib) wire compression — pure bandwidth win, no visual quality cost,
+            // so always on rather than exposed as its own toggle (same reasoning as clipboard/sec).
+            .appendQueryParameter("compression", "")
 
+        if (!networkPreset.isNullOrBlank()) uriBuilder.appendQueryParameter("network", networkPreset)
+        if (soundEnabled) uriBuilder.appendQueryParameter("sound", "sys:opensles")
+        if (udpEnabled) uriBuilder.appendQueryParameter("multitransport", "")
         if (!password.isNullOrEmpty()) uriBuilder.appendQueryParameter("p", password)
 
         val uri = uriBuilder.build()

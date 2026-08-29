@@ -45,6 +45,26 @@ interface IRemoteDesktopSessionService {
      * only, see SpiceKeycode's class doc in the plugin), so correct character delivery depends on
      * this matching the remote guest OS's own configured keyboard layout. Ignored by VNC/RDP,
      * which are already layout-independent (X11 keysyms / TS_UNICODE_KEYBOARD_EVENT respectively).
+     *
+     * [networkPreset]: RDP only — FreeRDP's own "/network:" performance preset ("lan", "auto", or
+     * "modem"; null/empty leaves it unset, i.e. FreeRDP's own default). "lan" enables
+     * wallpaper/theming/font-smoothing/animations for the sharpest picture; "modem" disables all
+     * of them for the least bandwidth; "auto" lets FreeRDP probe the link. This is a SEPARATE axis
+     * from [fastQuality] (which only controls colour depth) — the main app derives both together
+     * from one "Best/Balanced/Fast" UI choice rather than exposing this as its own control.
+     * Ignored by VNC/SPICE, which have no equivalent concept.
+     *
+     * [soundEnabled]: RDP only — redirects the remote desktop's system audio output (rdpsnd
+     * channel, OpenSL ES-backed) to this device's speakers. Binary on/off only: FreeRDP decodes
+     * and plays audio entirely in native code, with no JNI hook for a live volume/mute control
+     * (unlike the RustDesk plugin's Kotlin-side AudioTrack), so this can only be toggled at
+     * connect time — changing it means reconnecting, same as [fastQuality]. Ignored by VNC/SPICE.
+     *
+     * [udpEnabled]: RDP only — enables FreeRDP's "/multitransport" flag (MS-RDPEMT), letting the
+     * server carry bitmap data over a UDP side-channel alongside the main TCP connection for lower
+     * latency on lossy links. Requires server-side support (e.g. Windows RDS with UDP transport
+     * enabled) and an open UDP port matching the RDP port; if either is missing, FreeRDP silently
+     * falls back to TCP-only, so this is safe to enable speculatively. Ignored by VNC/SPICE.
      */
     IRemoteDesktopSession createSession(
         String protocol, String host, int port, String username, String password,
@@ -52,7 +72,8 @@ interface IRemoteDesktopSessionService {
         in IRemoteDesktopSessionCallback callback,
         boolean fastQuality, int overrideWidth, int overrideHeight,
         int tlsPort, String proxy, String caCert, String hostSubject,
-        String vncWsUrl, String vncWsCookie, String keyboardLayout);
+        String vncWsUrl, String vncWsCookie, String keyboardLayout,
+        String networkPreset, boolean soundEnabled, boolean udpEnabled);
 
     /**
      * RDP only: marks [host]:[port]'s current TLS certificate ([fingerprint], as reported via

@@ -108,7 +108,9 @@ class InfoActivity : Activity() {
                             .takeIf { it.exists() }?.readText(Charsets.UTF_8)
                             ?: "(no debug log found)"
                     )
-                    val cacheFile = java.io.File(cacheDir, "remotedesktop_plugin_debug.log").apply {
+                    // Subdirectory, not the cache root — file_paths.xml scopes the provider to it.
+                    val shareDir = java.io.File(cacheDir, "shared_logs").apply { mkdirs() }
+                    val cacheFile = java.io.File(shareDir, "remotedesktop_plugin_debug.log").apply {
                         writeText(anonymized, Charsets.UTF_8)
                     }
                     val uri = androidx.core.content.FileProvider.getUriForFile(
