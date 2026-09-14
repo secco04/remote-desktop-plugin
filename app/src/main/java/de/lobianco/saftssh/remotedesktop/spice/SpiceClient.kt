@@ -125,7 +125,7 @@ class SpiceClient(
     @Volatile private var lastButton = BTN_MOVE
     @Volatile private var pointerFbX = 0
     @Volatile private var pointerFbY = 0
-    @Volatile private var lastCursorBlitMs = 0L
+    @Volatile private var lastSupplementalBlitMs = 0L
     @Volatile private var relativeMode = false
     private val renderLock = Any()
 
@@ -138,7 +138,15 @@ class SpiceClient(
         zoomScale = scale.coerceAtLeast(0.1f)
         panX = newPanX
         panY = newPanY
-        blitToSurface()
+        // Throttled exactly like the cursor-move redraw below (see lastSupplementalBlitMs's doc) —
+        // this used to blit unconditionally, and the app's edge-pan auto-scroll calls setZoom on a
+        // steady 16ms timer, which drove an equally unthrottled stream of full-framebuffer redraws
+        // contending with real protocol-driven ones for renderLock.
+        val now = System.currentTimeMillis()
+        if (now - lastSupplementalBlitMs >= 16L) {
+            lastSupplementalBlitMs = now
+            blitToSurface()
+        }
     }
 
     /** Swaps in a fresh Surface mid-session, with retried re-blits across the resize settle window
@@ -312,8 +320,8 @@ class SpiceClient(
         }
         lastButton = currentButton
         val now = System.currentTimeMillis()
-        if (now - lastCursorBlitMs >= 16L) {
-            lastCursorBlitMs = now
+        if (now - lastSupplementalBlitMs >= 16L) {
+            lastSupplementalBlitMs = now
             blitToSurface()
         }
     }

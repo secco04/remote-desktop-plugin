@@ -138,13 +138,17 @@ class VncClient(
     @Volatile private var cursorHotspotX = 0
     @Volatile private var cursorHotspotY = 0
 
-    // Throttles the cursor-move-triggered redraw (below) to ~60fps. Touch delivers move events
-    // much faster than that (often 100+/sec during a drag), and every blitToSurface() takes the
-    // same renderLock the protocol thread uses to draw real server updates — without this, a fast
-    // drag could keep the lock busy compositing cursor-only frames and visibly delay real
-    // framebuffer updates from ever getting drawn, which read as "slow/laggy rendering" even
-    // though the actual network transfer was fine.
-    @Volatile private var lastCursorBlitMs = 0L
+    // Throttles supplemental redraws — cursor-move tracking (below) AND setZoom (further down) —
+    // to ~60fps, shared between both. Touch delivers move events much faster than that (often
+    // 100+/sec during a drag), and the app's pinch-zoom/edge-pan can drive setZoom at a steady
+    // 60Hz of its own; every blitToSurface() takes the same renderLock the protocol thread uses to
+    // draw real server updates — without this, either source (or both firing in the same tick)
+    // could keep the lock busy compositing frames nothing but the cursor/view moved in, delaying
+    // real framebuffer updates from ever getting drawn and reading as "slow/laggy rendering" even
+    // though the actual network transfer was fine. Sharing one timestamp between the two callers
+    // also coalesces a tick that fires both (as the edge-pan loop's setZoom + sendPointerEvent
+    // does) into a single blit instead of two.
+    @Volatile private var lastSupplementalBlitMs = 0L
 
     // Shift state for the synthetic-shift bracketing in sendKeyEvent. physicalShiftHeld tracks a
     // Shift the IME/hardware actually sent (so we don't add a redundant one); syntheticShiftHeld is
@@ -166,7 +170,17 @@ class VncClient(
         zoomScale = scale.coerceAtLeast(0.1f)
         panX = newPanX
         panY = newPanY
-        blitToSurface() // reflect the new zoom immediately, even without a fresh server frame
+        // Throttled exactly like the cursor-move redraw above (see lastSupplementalBlitMs's doc) —
+        // this used to blit unconditionally, and the app's edge-pan auto-scroll (holding the cursor
+        // against a zoomed view's border) calls setZoom on a steady 16ms timer, which drove an
+        // equally unthrottled stream of full-framebuffer redraws contending with real protocol
+        // updates for renderLock. Reported as "randscrollen laggt noch sehr" even after the timer
+        // itself was smoothed out — the remaining lag was this, not the pan math.
+        val now = System.currentTimeMillis()
+        if (now - lastSupplementalBlitMs >= 16L) {
+            lastSupplementalBlitMs = now
+            blitToSurface()
+        }
     }
 
     /** Swaps in a fresh Surface mid-session (the Surface is reallocated whenever the SurfaceView
@@ -253,10 +267,10 @@ class VncClient(
         }
         // The server won't push a frame just because our locally-drawn cursor moved — redraw so
         // the cursor tracks the finger smoothly between real framebuffer updates. Throttled (see
-        // lastCursorBlitMs's doc) so a fast drag can't starve real protocol-driven redraws.
+        // lastSupplementalBlitMs's doc) so a fast drag can't starve real protocol-driven redraws.
         val now = System.currentTimeMillis()
-        if (now - lastCursorBlitMs >= 16L) {
-            lastCursorBlitMs = now
+        if (now - lastSupplementalBlitMs >= 16L) {
+            lastSupplementalBlitMs = now
             blitToSurface()
         }
     }

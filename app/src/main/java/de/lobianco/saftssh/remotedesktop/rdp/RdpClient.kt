@@ -123,10 +123,13 @@ class RdpClient(
     // Last pointer position we sent, in framebuffer pixels — where SyntheticCursor is drawn.
     @Volatile private var pointerFbX = 0
     @Volatile private var pointerFbY = 0
-    // Throttles the cursor-move-triggered redraw to ~60fps — see VncClient's identical field for
-    // why (touch delivers move events far faster than that, and every redraw takes renderLock,
-    // so unthrottled it can starve real OnGraphicsUpdate-driven redraws and look "laggy").
-    @Volatile private var lastCursorBlitMs = 0L
+    // Throttles supplemental redraws — cursor-move tracking AND setZoom, below — to ~60fps, shared
+    // between both. See VncClient's identical field for the full reasoning (touch delivers move
+    // events far faster than that, the app's pinch-zoom/edge-pan can drive setZoom at a steady
+    // 60Hz of its own, and every redraw takes renderLock — unthrottled, either source can starve
+    // real OnGraphicsUpdate-driven redraws and look "laggy"; sharing one timestamp also coalesces
+    // a tick that fires both, as the edge-pan loop's setZoom + sendPointerEvent does, into one blit).
+    @Volatile private var lastSupplementalBlitMs = 0L
     // Serialises lockCanvas/unlock between the FreeRDP graphics-update thread and Binder threads
     // calling in on a pointer move (see VncClient for the same reasoning).
     private val renderLock = Any()
@@ -140,7 +143,18 @@ class RdpClient(
         zoomScale = scale.coerceAtLeast(0.1f)
         panX = newPanX
         panY = newPanY
-        blitToSurface() // reflect the new zoom immediately, even without a fresh server frame
+        // Throttled exactly like the cursor-move redraw below (see lastSupplementalBlitMs's doc) —
+        // this used to blit unconditionally, and the app's edge-pan auto-scroll (holding the cursor
+        // against a zoomed view's border) calls setZoom on a steady 16ms timer, which drove an
+        // equally unthrottled stream of full-framebuffer redraws contending with FreeRDP's own
+        // OnGraphicsUpdate-driven ones for renderLock. Reported as "randscrollen laggt noch sehr"
+        // even after the timer itself was smoothed out — the remaining lag was this, not the pan
+        // math, and RDP's typically-heavier update traffic is exactly why it showed up here first.
+        val now = System.currentTimeMillis()
+        if (now - lastSupplementalBlitMs >= 16L) {
+            lastSupplementalBlitMs = now
+            blitToSurface()
+        }
     }
 
     /** Swaps in a fresh Surface mid-session, with retried re-blits across the resize settle window
@@ -389,10 +403,10 @@ class RdpClient(
             .onSuccess { ok -> if (buttonMask != 0 || currentFlag != 0) AppLog.i(TAG, "sendCursorEvent($mx,$my,flags=0x${flags.toString(16)}) inst=$inst connected=$connected -> $ok") }
             .onFailure { e -> AppLog.w(TAG, "sendCursorEvent threw", e) }
         // Redraw so the synthetic cursor tracks the pointer between server frames. Throttled (see
-        // lastCursorBlitMs's doc) so a fast drag can't starve real protocol-driven redraws.
+        // lastSupplementalBlitMs's doc) so a fast drag can't starve real protocol-driven redraws.
         val now = System.currentTimeMillis()
-        if (now - lastCursorBlitMs >= 16L) {
-            lastCursorBlitMs = now
+        if (now - lastSupplementalBlitMs >= 16L) {
+            lastSupplementalBlitMs = now
             blitToSurface()
         }
     }
