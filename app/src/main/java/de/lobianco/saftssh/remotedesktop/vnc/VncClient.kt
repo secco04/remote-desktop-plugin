@@ -80,6 +80,10 @@ class VncClient(
     private val onProgress: (String) -> Unit,
     private val onConnected: (width: Int, height: Int) -> Unit,
     private val onDisconnected: (reason: String) -> Unit,
+    /** Fires whenever the remote framebuffer is (re)allocated, including the initial one — the
+     *  main app bounds its pinch-zoom panning to the real picture extent, see
+     *  IRemoteDesktopSessionCallback.onRemoteSize. Defaulted so nothing else has to supply it. */
+    private val onRemoteSize: (width: Int, height: Int) -> Unit = { _, _ -> },
     /** Proxmox VE only — when set, connects via [ProxmoxVncWebSocket] to this full
      *  "https://host:port/api2/json/nodes/{node}/qemu/{vmid}/vncwebsocket?port=...&vncticket=..."
      *  URL instead of a raw [Socket] to [host]:[port] — see that class's doc for why Proxmox's VNC
@@ -362,6 +366,9 @@ class VncClient(
             framebuffer = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
 
             onProgress("Connected — ${w}x${h}")
+            // Before onConnected, so the app already knows the picture extent the moment it starts
+            // treating the session as live.
+            onRemoteSize(w, h)
             onConnected(w, h)
 
             requestFramebufferUpdate(out, incremental = false)
@@ -636,6 +643,7 @@ class VncClient(
                     pointerFbX = pointerFbX.coerceIn(0, w - 1)
                     pointerFbY = pointerFbY.coerceIn(0, h - 1)
                     framebuffer = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                    onRemoteSize(w, h)
                 }
                 else -> throw IOException("Unsupported encoding $encoding — server ignored our SetEncodings")
             }

@@ -198,6 +198,7 @@ class RemoteDesktopSessionService : Service() {
                     password = password,
                     fastQuality = fastQuality,
                     onProgress = { line -> runCatching { callback?.onProgress(line) } },
+                    onRemoteSize = { w, h -> runCatching { callback?.onRemoteSize(w, h) } },
                     onConnected = { w, h ->
                         runCatching { callback?.onConnected() }
                         AppLog.i(TAG, "VNC connected: ${w}x$h")
@@ -238,6 +239,7 @@ class RemoteDesktopSessionService : Service() {
                     soundEnabled = soundEnabled,
                     udpEnabled = udpEnabled,
                     onProgress = { line -> runCatching { callback?.onProgress(line) } },
+                    onRemoteSize = { w, h -> runCatching { callback?.onRemoteSize(w, h) } },
                     onConnected = { w, h ->
                         runCatching { callback?.onConnected() }
                         AppLog.i(TAG, "RDP connected: ${w}x$h")
@@ -268,6 +270,7 @@ class RemoteDesktopSessionService : Service() {
                     port = resolvedPort,
                     password = password,
                     onProgress = { line -> runCatching { callback?.onProgress(line) } },
+                    onRemoteSize = { w, h -> runCatching { callback?.onRemoteSize(w, h) } },
                     onConnected = { w, h ->
                         runCatching { callback?.onConnected() }
                         AppLog.i(TAG, "SPICE connected: ${w}x$h")

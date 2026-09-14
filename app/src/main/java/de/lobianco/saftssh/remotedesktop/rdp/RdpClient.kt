@@ -92,6 +92,10 @@ class RdpClient(
     private val onProgress: (String) -> Unit,
     private val onConnected: (width: Int, height: Int) -> Unit,
     private val onDisconnected: (reason: String) -> Unit,
+    /** Fires whenever the remote framebuffer is (re)allocated, including the initial one — the
+     *  main app bounds its pinch-zoom panning to the real picture extent, see
+     *  IRemoteDesktopSessionCallback.onRemoteSize. Defaulted so nothing else has to supply it. */
+    private val onRemoteSize: (width: Int, height: Int) -> Unit = { _, _ -> },
 ) {
     private val certStore = RdpCertStore(context)
     private var inst: Long = 0
@@ -318,6 +322,9 @@ class RdpClient(
      *  negotiated colour depth; no need for the reference client's RGB_565-for-16bpp branch. */
     private fun allocateFramebuffer(width: Int, height: Int) {
         bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        // The single choke point for both the initial size (OnSettingsChanged) and a later
+        // server-initiated resize (OnGraphicsResize), so reporting here covers both.
+        onRemoteSize(width, height)
     }
 
     /** Returns 1 (accept) only if [fingerprint] matches what's already trusted for this host;

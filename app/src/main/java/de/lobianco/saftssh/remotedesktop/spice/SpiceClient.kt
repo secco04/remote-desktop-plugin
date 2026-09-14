@@ -80,6 +80,10 @@ class SpiceClient(
     private val onProgress: (String) -> Unit,
     private val onConnected: (width: Int, height: Int) -> Unit,
     private val onDisconnected: (reason: String) -> Unit,
+    /** Fires whenever the remote framebuffer is (re)allocated, including the initial one — the
+     *  main app bounds its pinch-zoom panning to the real picture extent, see
+     *  IRemoteDesktopSessionCallback.onRemoteSize. Defaulted so nothing else has to supply it. */
+    private val onRemoteSize: (width: Int, height: Int) -> Unit = { _, _ -> },
     /** > 0 selects the Proxmox VE (.vv-file) connect path — see class doc. */
     private val tlsPort: Int = 0,
     /** Proxmox spiceproxy's CONNECT-tunnel address, e.g. "http://pve.example.com:3128". */
@@ -246,6 +250,9 @@ class SpiceClient(
         bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).apply { setHasAlpha(false) }
         pointerFbX = width / 2
         pointerFbY = height / 2
+        // Outside the !connected guard: this callback also fires when the guest changes resolution
+        // mid-session, and the app's pan bounds have to follow that.
+        onRemoteSize(width, height)
         if (!connected) {
             connected = true
             onProgress("Connected — ${width}x$height")
