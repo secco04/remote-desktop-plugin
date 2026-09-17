@@ -45,9 +45,20 @@ object RdpKeycode {
     private const val VK_BACK = 0x08
     private const val VK_TAB = 0x09
     private const val VK_RETURN = 0x0D
-    private const val VK_SHIFT = 0x10
-    private const val VK_CONTROL = 0x11
-    private const val VK_MENU = 0x12 // Alt
+    // NOT VK_SHIFT/VK_CONTROL/VK_MENU (the generic 0x10/0x11/0x12 constants) — WinPR's scancode
+    // tables (winpr/include/winpr/input.h's KBD4_T*/KBD4_X* macros) only ever store the L/R-specific
+    // variants at their scancode slots (e.g. `KBD4_T1D VK_LCONTROL`, never plain VK_CONTROL). Handing
+    // the generic constant to GetVirtualScanCodeFromVirtualKeyCode's reverse lookup finds nothing and
+    // silently returns scancode 0 — the exact same "no-op" failure mode as the missing-KBDEXT bug
+    // above, just for every Ctrl/Alt/Shift press instead of the nav cluster. This is why a latched
+    // Ctrl never actually reached the remote: the Ctrl-down event did nothing, so only the following
+    // letter's keystroke landed (reported as "Strg+C schreibt nur C").
+    private const val VK_LSHIFT = 0xA0
+    private const val VK_RSHIFT = 0xA1
+    private const val VK_LCONTROL = 0xA2
+    private const val VK_RCONTROL = 0xA3
+    private const val VK_LMENU = 0xA4 // Left Alt
+    private const val VK_RMENU = 0xA5 // Right Alt (AltGr on most non-US layouts)
     private const val VK_ESCAPE = 0x1B
     private const val VK_PRIOR = 0x21 // Page Up
     private const val VK_NEXT = 0x22 // Page Down
@@ -83,9 +94,14 @@ object RdpKeycode {
         KeyEvent.KEYCODE_MOVE_END -> ext(VK_END)
         KeyEvent.KEYCODE_INSERT -> ext(VK_INSERT)
         KeyEvent.KEYCODE_CAPS_LOCK -> VK_CAPITAL
-        KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.KEYCODE_CTRL_RIGHT -> VK_CONTROL
-        KeyEvent.KEYCODE_ALT_LEFT, KeyEvent.KEYCODE_ALT_RIGHT -> VK_MENU
-        KeyEvent.KEYCODE_SHIFT_LEFT, KeyEvent.KEYCODE_SHIFT_RIGHT -> VK_SHIFT
+        // Right Ctrl/Alt live in the EXTENDED table (KBD4_X1D/KBD4_X38) — need ext() like the nav
+        // keys above. Right Shift is, oddly, in the MAIN table (KBD4_T36) — no ext() there.
+        KeyEvent.KEYCODE_CTRL_LEFT -> VK_LCONTROL
+        KeyEvent.KEYCODE_CTRL_RIGHT -> ext(VK_RCONTROL)
+        KeyEvent.KEYCODE_ALT_LEFT -> VK_LMENU
+        KeyEvent.KEYCODE_ALT_RIGHT -> ext(VK_RMENU)
+        KeyEvent.KEYCODE_SHIFT_LEFT -> VK_LSHIFT
+        KeyEvent.KEYCODE_SHIFT_RIGHT -> VK_RSHIFT
         KeyEvent.KEYCODE_META_LEFT, KeyEvent.KEYCODE_META_RIGHT -> ext(VK_LWIN)
         in KeyEvent.KEYCODE_F1..KeyEvent.KEYCODE_F12 -> VK_F1 + (keyCode - KeyEvent.KEYCODE_F1)
         else -> null
