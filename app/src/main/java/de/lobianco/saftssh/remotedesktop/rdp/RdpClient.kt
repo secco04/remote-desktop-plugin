@@ -47,10 +47,12 @@ private fun rdpButtonFlag(vncButtonMask: Int): Int = when {
  * Mirrors [de.lobianco.saftssh.remotedesktop.vnc.VncClient]'s shape: connect, render onto a
  * Surface, forward input — so RemoteDesktopSessionService can treat both protocols uniformly.
  *
- * The native libraries backing this (libfreerdp-android.so and friends) are prebuilt binaries
- * extracted from iiordanov/remote-desktop-clients' official "freeaRDP" GitHub Release APK
- * (v6.4.5) — building FreeRDP from source needs a multi-hour native cross-compile toolchain
- * (Cerbero) this project doesn't set up. See this repo's LICENSE for attribution.
+ * The native libraries backing this (libfreerdp-android.so and friends) are, as of 2026-09, built
+ * from FreeRDP's own upstream source at tag 3.31.1 (previously: prebuilt binaries extracted from
+ * iiordanov/remote-desktop-clients' "freeaRDP" release APK, built from the older 2.11.7 tag) —
+ * rebuilt from source specifically to pick up real RDP cursor-shape support (see
+ * [LibFreeRDP.UIEventListener.OnPointerSet] and this file's [cursorBitmap]). See this repo's
+ * LICENSE for attribution.
  *
  * Certificate trust: unlike VNC (no certificates involved), RDP's TLS layer means every unknown
  * server certificate needs a decision — mirrors the main app's own SSH host-key confirmation flow
@@ -89,6 +91,16 @@ class RdpClient(
      *  createSession's [udpEnabled] doc; safe to always request, FreeRDP falls back to TCP-only
      *  on its own if the server/network doesn't support it. */
     private val udpEnabled: Boolean = false,
+    /** "us" | "de" | "fr" — sets FreeRDP's own "/kbd:layout:" connect-time parameter, i.e. the
+     *  KEYBOARD LAYOUT THE SERVER NEGOTIATES for this session (not a client-side scancode remap —
+     *  RDP has no such thing; contrast SPICE's setKeyboardLayout). Requires a reconnect to change,
+     *  same as [fastQuality]/[networkPreset]. Matters in exactly the case [unicodeSupported] exists
+     *  for: once a server rejects Unicode input and printable characters fall back to the
+     *  Virtual-Key path, the SERVER's active keyboard layout is what turns a VK code into an actual
+     *  character — a mismatched layout there is the same "wrong key produces wrong character"
+     *  problem any RDP client has against such a server. Null/blank leaves it unset (FreeRDP's own
+     *  default, effectively US). */
+    private val keyboardLayout: String? = null,
     private val onProgress: (String) -> Unit,
     private val onConnected: (width: Int, height: Int) -> Unit,
     private val onDisconnected: (reason: String) -> Unit,
@@ -120,9 +132,31 @@ class RdpClient(
     // without PTR_FLAGS_DOWN) — RDP has no "no buttons" release, the button flag must be
     // repeated on the up event.
     @Volatile private var lastButtonFlag = 0
-    // Last pointer position we sent, in framebuffer pixels — where SyntheticCursor is drawn.
+    // Last pointer position we sent, in framebuffer pixels — where the cursor is drawn.
     @Volatile private var pointerFbX = 0
     @Volatile private var pointerFbY = 0
+
+    // Real remote cursor shape (FreeRDP 3.x OnPointerSet et al.) — null falls back to
+    // SyntheticCursor below, matching the pre-3.x behaviour when no real shape has arrived yet
+    // (or the remote explicitly asked for the platform default via OnPointerSetDefault).
+    @Volatile private var cursorBitmap: Bitmap? = null
+    @Volatile private var cursorHotX = 0
+    @Volatile private var cursorHotY = 0
+    // Remote explicitly hid the cursor (OnPointerSetNull) — draw nothing at all, not even the
+    // synthetic fallback, so it doesn't reappear where the real cursor was deliberately hidden.
+    @Volatile private var cursorHidden = false
+    // User-adjustable multiplier on the cursor's rendered size — see setCursorScale's doc. Default
+    // above 1.0 because Windows cursor bitmaps (commonly 32x32 remote px) render very small on a
+    // typical high-DPI phone screen at the raw base letterbox scale.
+    @Volatile private var cursorScale = 2f
+    // Whether the connected server accepted Unicode keyboard input — see
+    // LibFreeRDP.isUnicodeInputSupported's doc for why this MUST be checked before ever calling
+    // sendUnicodeKeyEvent: on a server that doesn't support it, that call's normal, documented
+    // failure return is misread by the vendored native library as a fatal transport error and
+    // tears down the whole connection — reported as "beim ersten Tippen reconnected/freezed es
+    // komplett, keine Mausbewegung, kein Bildupdate". Optimistic default (most servers support it);
+    // set for real right after OnSettingsChanged confirms the connection actually negotiated.
+    @Volatile private var unicodeSupported = true
     // Throttles supplemental redraws — cursor-move tracking AND setZoom, below — to ~60fps, shared
     // between both. See VncClient's identical field for the full reasoning (touch delivers move
     // events far faster than that, the app's pinch-zoom/edge-pan can drive setZoom at a steady
@@ -157,6 +191,14 @@ class RdpClient(
         }
     }
 
+    /** RDP-only user-adjustable cursor size — see IRemoteDesktopSession.setCursorScale's AIDL doc.
+     *  Clamped to a sane range so a bad value from the UI can't render an unusably huge or
+     *  invisible cursor. */
+    fun setCursorScale(scale: Float) {
+        cursorScale = scale.coerceIn(0.5f, 4f)
+        blitToSurface()
+    }
+
     /** Swaps in a fresh Surface mid-session, with retried re-blits across the resize settle window
      *  — see VncClient.updateSurface's doc for the full reasoning (a single blit can race the
      *  reallocating buffer during an IME/rotation resize and, on a static remote screen, leave the
@@ -168,10 +210,20 @@ class RdpClient(
         blitFailing = false
         surfaceRefreshThread?.interrupt()
         surfaceRefreshThread = Thread {
-            for (delayMs in longArrayOf(0, 60, 150, 300, 550)) {
+            for (delayMs in longArrayOf(0, 60, 150, 300, 550, 900, 1500)) {
                 try { Thread.sleep(delayMs) } catch (_: InterruptedException) { return@Thread }
-                if (targetSurface !== surface) return@Thread
-                blitToSurface()
+                // Clear the backoff before EVERY attempt, not once before the loop. The first
+                // failure re-arms it (blitToSurface sets blitFailing on a failed lockCanvas), and
+                // that method's own guard then swallows every remaining retry in this ladder —
+                // they all fall well inside BLIT_RETRY_INTERVAL_MS. So the settle-window retry this
+                // thread exists for was, in practice, a SINGLE attempt: if that one landed while
+                // the buffer was still reallocating, a STATIC remote screen had nothing left to
+                // re-trigger a draw and stayed black indefinitely. Reported after opening another
+                // protocol's tab and switching back — starting that other session keeps the device
+                // busy for about as long as this ladder used to run, which is why it showed up there.
+                blitFailing = false
+                blitToSurface(force = true)
+                if (!blitFailing) return@Thread   // one landed — nothing left to retry
             }
         }.apply { isDaemon = true; start() }
     }
@@ -198,6 +250,10 @@ class RdpClient(
                 allocateFramebuffer(width, height)
                 pointerFbX = width / 2
                 pointerFbY = height / 2
+                unicodeSupported = LibFreeRDP.isUnicodeInputSupported(inst)
+                if (!unicodeSupported) {
+                    AppLog.w(TAG, "Server does not support Unicode keyboard input — falling back to Virtual-Key path for printable characters")
+                }
                 if (!connected) {
                     connected = true
                     onProgress("Connected — ${width}x$height")
@@ -223,19 +279,37 @@ class RdpClient(
                 usernameOut: StringBuilder, domainOut: StringBuilder, passwordOut: StringBuilder,
             ): Boolean = OnAuthenticate(usernameOut, domainOut, passwordOut)
 
-            // Note the misspelled method name ("Verifiy") — matches FreeRDP 2.11.7's
-            // UIEventListener interface exactly, since that's the version the vendored
-            // native libraries were built from (see LibFreeRDP.java's class doc). No certPort/
-            // flags params either — that's a newer-FreeRDP addition this build predates.
-            override fun OnVerifiyCertificate(
-                commonName: String?, subject: String?, issuer: String?, fingerprint: String?,
-                mismatch: Boolean,
+            // FreeRDP 3.x's *Ex signatures (host/port/flags replace the old bare hostMismatch
+            // boolean — see LibFreeRDP.java's class doc). host/port/flags aren't needed for our
+            // trust decision (fingerprint-only, same as before), so they're unused here.
+            override fun OnVerifyCertificateEx(
+                host: String?, port: Long, commonName: String?, subject: String?, issuer: String?,
+                fingerprint: String?, flags: Long,
             ): Int = decideCertificateTrust(fingerprint)
 
-            override fun OnVerifyChangedCertificate(
-                commonName: String?, subject: String?, issuer: String?, fingerprint: String?,
-                oldSubject: String?, oldIssuer: String?, oldFingerprint: String?,
+            override fun OnVerifyChangedCertificateEx(
+                host: String?, port: Long, commonName: String?, subject: String?, issuer: String?,
+                fingerprint: String?, oldSubject: String?, oldIssuer: String?,
+                oldFingerprint: String?, flags: Long,
             ): Int = decideCertificateTrust(fingerprint)
+
+            // Real remote cursor shape (FreeRDP 3.x, upstream PR #12786) — see cursorBitmap's doc.
+            override fun OnPointerSet(pixels: IntArray, width: Int, height: Int, xPos: Int, yPos: Int) {
+                cursorBitmap = Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
+                cursorHotX = xPos
+                cursorHotY = yPos
+                cursorHidden = false
+            }
+
+            override fun OnPointerSetNull() {
+                cursorBitmap = null
+                cursorHidden = true
+            }
+
+            override fun OnPointerSetDefault() {
+                cursorBitmap = null
+                cursorHidden = false
+            }
 
             override fun OnGraphicsUpdate(x: Int, y: Int, width: Int, height: Int) {
                 // Pull the freshly-painted region out of FreeRDP's native GDI buffer into our
@@ -290,6 +364,34 @@ class RdpClient(
         if (soundEnabled) uriBuilder.appendQueryParameter("sound", "sys:opensles")
         if (udpEnabled) uriBuilder.appendQueryParameter("multitransport", "")
         if (!password.isNullOrEmpty()) uriBuilder.appendQueryParameter("p", password)
+        // "unicode:on" is THE fix for characters arriving wrong (y/z swapped, no umlauts) on some
+        // servers: FreeRDP's own command-line parser DISABLES Unicode keyboard input by default
+        // ("/* Disable unicode input unless requested. */" in client/common/cmdline.c, right before
+        // parse_command_line), and capabilities.c only consults the SERVER's advertised support
+        // when the client already has it enabled ("If disabled in client pre_connect, it can
+        // disable announcing the feature"). So without this, FreeRDP_UnicodeInput stays FALSE no
+        // matter what the server supports, every sendUnicodeKeyEvent() is refused with the
+        // misleading "Unicode input not supported by server", and printable characters fall back to
+        // the Virtual-Key path — which the server then re-interprets through ITS keyboard layout,
+        // producing exactly the reported "QWERTZ eingestellt, kommt trotzdem QWERTY raus".
+        // With Unicode input actually on, characters transmit verbatim and no layout is involved.
+        //
+        // Both settings must go in ONE "kbd" query parameter, comma-separated: LibFreeRDP's
+        // setConnectionInfo(Uri) iterates getQueryParameterNames() (a SET — one entry per name) and
+        // reads getQueryParameter(), which returns only the FIRST value, so a second kbd= would be
+        // silently dropped. FreeRDP's own parse_kbd_options splits the value on commas.
+        //
+        // Windows keyboard layout identifiers (KLIDs) — stable OS constants, not FreeRDP-specific.
+        // The layout still matters for the Virtual-Key path (special/modifier keys, and the
+        // fallback if a server really does refuse Unicode) — see [keyboardLayout]'s doc.
+        val klid = when (keyboardLayout) {
+            "de" -> "0x00000407"
+            "fr" -> "0x0000040c"
+            "us" -> "0x00000409"
+            else -> null
+        }
+        val kbdOpts = listOfNotNull("unicode:on", klid?.let { "layout:$it" }).joinToString(",")
+        uriBuilder.appendQueryParameter("kbd", kbdOpts)
 
         val uri = uriBuilder.build()
         onProgress("Connecting to $host:$port…")
@@ -441,19 +543,35 @@ class RdpClient(
             if (vk != 0) { runCatching { LibFreeRDP.sendKeyEvent(inst, vk, down) }; return }
         }
         when (val mapped = RdpKeycode.map(keyCode, unicodeChar)) {
-            is RdpKeycode.Mapped.Unicode -> runCatching { LibFreeRDP.sendUnicodeKeyEvent(inst, mapped.codepoint, down) }
+            is RdpKeycode.Mapped.Unicode -> {
+                // See unicodeSupported's doc: sending this to a server that doesn't support it
+                // kills the whole connection in the vendored native library, so it must never be
+                // attempted at all — not even once, since the crash happens on the FIRST call.
+                if (unicodeSupported) {
+                    runCatching { LibFreeRDP.sendUnicodeKeyEvent(inst, mapped.codepoint, down) }
+                } else {
+                    val vk = RdpKeycode.vkForChar(mapped.codepoint)
+                    if (vk != 0) runCatching { LibFreeRDP.sendKeyEvent(inst, vk, down) }
+                    // Punctuation/symbols beyond a-z/A-Z/0-9 have no VK fallback here — an inherent
+                    // limitation of a server that doesn't negotiate Unicode input at all, same as
+                    // any other RDP client would face against it.
+                }
+            }
             is RdpKeycode.Mapped.VirtualKey -> runCatching { LibFreeRDP.sendKeyEvent(inst, mapped.vk, down) }
             RdpKeycode.Mapped.None -> {}
         }
     }
 
     /** See VncClient.blitToSurface's doc for the display-off backoff reasoning — identical here. */
-    private fun blitToSurface() {
+    /** [force] bypasses the display-off backoff below — only updateSurface's bounded
+     *  settle-window ladder uses it; see there for why the backoff would otherwise
+     *  suppress its own retries. */
+    private fun blitToSurface(force: Boolean = false) {
         val bmp = bitmap ?: return
         val surface = targetSurface ?: return
         if (!surface.isValid) return
         val now = System.currentTimeMillis()
-        if (blitFailing && now - lastBlitAttemptMs < BLIT_RETRY_INTERVAL_MS) return
+        if (!force && blitFailing && now - lastBlitAttemptMs < BLIT_RETRY_INTERVAL_MS) return
         lastBlitAttemptMs = now
         synchronized(renderLock) {
             try {
@@ -462,7 +580,8 @@ class RdpClient(
                     // Letterbox * zoom — see VncClient.blitToSurface for the identical reasoning.
                     val sw = canvas.width
                     val sh = canvas.height
-                    val scale = minOf(sw.toFloat() / bmp.width, sh.toFloat() / bmp.height) * zoomScale
+                    val baseScale = minOf(sw.toFloat() / bmp.width, sh.toFloat() / bmp.height)
+                    val scale = baseScale * zoomScale
                     val dw = bmp.width * scale
                     val dh = bmp.height * scale
                     // Top-anchored vertically, not centred — see VncClient.blitToSurface's doc.
@@ -473,14 +592,38 @@ class RdpClient(
                     renderOffsetY = oy
                     canvas.drawColor(Color.BLACK)
                     canvas.drawBitmap(bmp, null, RectF(ox, oy, ox + dw, oy + dh), null)
-                    SyntheticCursor.draw(canvas, ox + pointerFbX * scale, oy + pointerFbY * scale)
+                    // Real remote cursor shape when we have one (FreeRDP 3.x) — same render
+                    // pipeline as the framebuffer itself, so it stays in sync with pan/zoom.
+                    // Falls back to the synthetic cursor when no real shape has arrived yet or
+                    // the remote asked for the platform default (OnPointerSetDefault); drawn
+                    // nothing at all when the remote explicitly hid it (OnPointerSetNull).
+                    // Position uses the full scale (incl. pinch-zoom) so it stays anchored to the
+                    // right spot on the picture; SIZE deliberately uses only baseScale — a real
+                    // cursor doesn't visually balloon when the user pinch-zooms in, same as every
+                    // other remote-desktop client (reported as "cursor wird groß" when this used
+                    // the zoomed scale for both).
+                    val cursor = cursorBitmap
+                    if (!cursorHidden) {
+                        if (cursor != null) {
+                            val cx = ox + (pointerFbX - cursorHotX) * scale
+                            val cy = oy + (pointerFbY - cursorHotY) * scale
+                            val cursorSize = baseScale * cursorScale
+                            canvas.drawBitmap(
+                                cursor, null,
+                                RectF(cx, cy, cx + cursor.width * cursorSize, cy + cursor.height * cursorSize),
+                                null,
+                            )
+                        } else {
+                            SyntheticCursor.draw(canvas, ox + pointerFbX * scale, oy + pointerFbY * scale)
+                        }
+                    }
                 } finally {
                     surface.unlockCanvasAndPost(canvas)
                 }
                 blitFailing = false
             } catch (e: Exception) {
                 blitFailing = true
-                AppLog.w(TAG, "blitToSurface failed: ${e.message}")
+                AppLog.w(TAG, "blitToSurface failed: ${e.javaClass.simpleName}: ${e.message}", e)
             }
         }
     }

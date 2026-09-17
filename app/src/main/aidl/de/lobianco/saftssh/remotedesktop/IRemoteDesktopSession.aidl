@@ -71,6 +71,17 @@ interface IRemoteDesktopSession {
     boolean isAlive();
 
     /**
+     * RDP only: scales the rendered size of the real remote cursor shape (FreeRDP 3.x's
+     * OnPointerSet bitmap) LIVE, without reconnecting — a user-adjustable multiplier on top of the
+     * base letterbox fit (1.0 = the cursor's native remote-pixel size at that fit, independent of
+     * pinch-zoom, see RdpClient.blitToSurface's doc). Added because Windows cursor bitmaps often
+     * render very small on a high-DPI phone screen at 1.0. VNC/SPICE ignore this (they still use
+     * the fixed-size SyntheticCursor overlay, which doesn't have a real remote bitmap to scale).
+     * oneway: fire-and-forget, applied on the next drawn frame.
+     */
+    oneway void setCursorScale(float scale);
+
+    /**
      * Tears down the connection and releases the Surface. oneway: the native VNC/RDP teardown
      * (closing sockets, freeing the FreeRDP instance) can block for an unbounded time — e.g.
      * FreeRDP's disconnect() waits for its own connect-thread to unwind, which can stall on a

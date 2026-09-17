@@ -10,12 +10,22 @@ import android.view.KeyEvent
  *    UTF-16 code unit; independent of the negotiated keyboard layout).
  *  - Everything else → `sendKeyEvent`, which — despite the name — expects a **Windows Virtual-Key
  *    code** (VK_*), NOT a scancode: the native `jni_freerdp_send_key_event` calls
- *    `GetVirtualScanCodeFromVirtualKeyCode(keycode, 4)` and sets the KBD_FLAGS_EXTENDED flag from
- *    the result itself (verified in FreeRDP 2.11.7's android_freerdp.c, not guessed). So arrows,
- *    Home/End, etc. — which need an "extended" (0xE0-prefixed) scancode — just work by passing
- *    their plain VK code; FreeRDP does the scancode+extended-flag translation. (An earlier version
- *    that tried to pass raw PC/AT scancodes here was wrong — the native side reinterpreted them as
- *    VK codes, so e.g. Enter's 0x1C became VK_CONVERT.)
+ *    `GetVirtualScanCodeFromVirtualKeyCode(keycode, 4)` and derives KBD_FLAGS_EXTENDED from the
+ *    RESULT. (An earlier version that tried to pass raw PC/AT scancodes here was wrong — the native
+ *    side reinterpreted them as VK codes, so e.g. Enter's 0x1C became VK_CONVERT.)
+ *
+ *    IMPORTANT — extended keys must carry [KBDEXT] themselves. WinPR picks which scancode table to
+ *    search from the flag on the VK code it is HANDED, not from what it finds:
+ *      `if (vkcode & KBDEXT) search KBD4X else search KBD4T`   (winpr/libwinpr/input/scancode.c)
+ *    and those tables are scancode→VK, looked up in reverse. VK_UP, VK_LEFT, VK_HOME, VK_DELETE …
+ *    exist ONLY in the extended table — the main table holds VK_NUMPAD8 etc. at those slots
+ *    (`#define KBD4_T48 VK_NUMPAD8 /* VK_UP */` vs `#define KBD4_X48 VK_UP`). So handing over a
+ *    BARE VK_UP made the reverse lookup search the main table, find nothing, and return scancode
+ *    0 — the native side then sent a nil scancode and the key silently did nothing. Only the keys
+ *    that live in the main table (ESC, TAB, ENTER, BACKSPACE, F1–F12, the modifiers) ever worked,
+ *    which is exactly the reported "die meisten Specialkeybar-Tasten funktionieren nicht, nur ESC
+ *    und Tab". With the flag set, WinPR returns `scancode | KBDEXT` and the native code turns that
+ *    into KBD_FLAGS_EXTENDED on the wire, which is what it was written to expect all along.
  */
 object RdpKeycode {
     sealed class Mapped {
@@ -23,6 +33,13 @@ object RdpKeycode {
         data class VirtualKey(val vk: Int) : Mapped()
         object None : Mapped()
     }
+
+    /** WinPR's "extended key" flag (KBDEXT in winpr/input.h) — see the class doc for why every
+     *  extended-only VK below must be OR'd with this before it reaches sendKeyEvent. */
+    private const val KBDEXT = 0x0100
+
+    /** Marks a VK code as living in the EXTENDED scancode table (arrows, the nav cluster, Win). */
+    private fun ext(vk: Int): Int = vk or KBDEXT
 
     // Windows Virtual-Key codes (stable OS constants).
     private const val VK_BACK = 0x08
@@ -51,23 +68,25 @@ object RdpKeycode {
     fun vkForKeyCode(keyCode: Int): Int? = when (keyCode) {
         KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> VK_RETURN
         KeyEvent.KEYCODE_DEL -> VK_BACK
-        KeyEvent.KEYCODE_FORWARD_DEL -> VK_DELETE
+        // ext(...) = extended-only keys — see the class doc; without KBDEXT these resolve to
+        // scancode 0 and do nothing at all.
+        KeyEvent.KEYCODE_FORWARD_DEL -> ext(VK_DELETE)
         KeyEvent.KEYCODE_TAB -> VK_TAB
         KeyEvent.KEYCODE_ESCAPE -> VK_ESCAPE
-        KeyEvent.KEYCODE_DPAD_LEFT -> VK_LEFT
-        KeyEvent.KEYCODE_DPAD_UP -> VK_UP
-        KeyEvent.KEYCODE_DPAD_RIGHT -> VK_RIGHT
-        KeyEvent.KEYCODE_DPAD_DOWN -> VK_DOWN
-        KeyEvent.KEYCODE_PAGE_UP -> VK_PRIOR
-        KeyEvent.KEYCODE_PAGE_DOWN -> VK_NEXT
-        KeyEvent.KEYCODE_MOVE_HOME -> VK_HOME
-        KeyEvent.KEYCODE_MOVE_END -> VK_END
-        KeyEvent.KEYCODE_INSERT -> VK_INSERT
+        KeyEvent.KEYCODE_DPAD_LEFT -> ext(VK_LEFT)
+        KeyEvent.KEYCODE_DPAD_UP -> ext(VK_UP)
+        KeyEvent.KEYCODE_DPAD_RIGHT -> ext(VK_RIGHT)
+        KeyEvent.KEYCODE_DPAD_DOWN -> ext(VK_DOWN)
+        KeyEvent.KEYCODE_PAGE_UP -> ext(VK_PRIOR)
+        KeyEvent.KEYCODE_PAGE_DOWN -> ext(VK_NEXT)
+        KeyEvent.KEYCODE_MOVE_HOME -> ext(VK_HOME)
+        KeyEvent.KEYCODE_MOVE_END -> ext(VK_END)
+        KeyEvent.KEYCODE_INSERT -> ext(VK_INSERT)
         KeyEvent.KEYCODE_CAPS_LOCK -> VK_CAPITAL
         KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.KEYCODE_CTRL_RIGHT -> VK_CONTROL
         KeyEvent.KEYCODE_ALT_LEFT, KeyEvent.KEYCODE_ALT_RIGHT -> VK_MENU
         KeyEvent.KEYCODE_SHIFT_LEFT, KeyEvent.KEYCODE_SHIFT_RIGHT -> VK_SHIFT
-        KeyEvent.KEYCODE_META_LEFT, KeyEvent.KEYCODE_META_RIGHT -> VK_LWIN
+        KeyEvent.KEYCODE_META_LEFT, KeyEvent.KEYCODE_META_RIGHT -> ext(VK_LWIN)
         in KeyEvent.KEYCODE_F1..KeyEvent.KEYCODE_F12 -> VK_F1 + (keyCode - KeyEvent.KEYCODE_F1)
         else -> null
     }

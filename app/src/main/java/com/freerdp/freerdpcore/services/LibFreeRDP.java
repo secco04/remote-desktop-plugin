@@ -12,27 +12,22 @@
    plugin is GPL-3.0, see this repo's LICENSE, MPL/GPL combination is expressly permitted
    by MPL 2.0 section 3.3):
 
-   Vendored from FreeRDP's own upstream Android client at tag 2.11.7 (NOT master —
-   the prebuilt native libraries bundled in this plugin were built from that exact
-   tag per iiordanov/remote-desktop-clients' own build-deps.conf, and FreeRDP's
-   Android JNI surface has changed since; an earlier version of this file was
-   mistakenly vendored from current master and crashed at runtime with
-   "Failed to register native method ... freerdp_get_build_date" because the
-   native library's JNI_OnLoad batch-registers ALL its native methods against this
-   class in one call, and no static/native method here matched
-   freerdp_get_build_date — RegisterNatives has no partial-success mode, so a
-   single unresolvable entry aborts the whole batch):
-   https://github.com/FreeRDP/FreeRDP/blob/2.11.7/client/Android/Studio/freeRDPCore/src/main/java/com/freerdp/freerdpcore/services/LibFreeRDP.java
+   As of 2026-09, the native libraries backing this were built from FreeRDP's own
+   upstream source at tag 3.31.1 (client/Android/Studio/freeRDPCore's own CMake
+   project, built standalone under WSL rather than through Gradle) instead of the
+   previously-vendored prebuilt 2.11.7 binaries — done specifically to pick up
+   real RDP cursor-shape support (upstream PR #12786's OnPointerSet/
+   OnPointerSetNull/OnPointerSetDefault callbacks, added below), which the old
+   2.11.7-era build predates. This file's structure (class doc, native method
+   list, listener interfaces) is still modeled on FreeRDP's own upstream JNI
+   bridge for that tag:
+   https://github.com/FreeRDP/FreeRDP/blob/3.31.1/client/Android/Studio/freeRDPCore/src/main/java/com/freerdp/freerdpcore/services/LibFreeRDP.java
    NOT from the bVNC fork — this is FreeRDP's own JNI bridge, license-clean and
-   independent of bVNC's GPL-3.0 codebase (verified none of bVNC's ~20 build
-   patches touch this file's native method declarations or the OnXxx callback
-   methods native code invokes by name — they only touch the BookmarkBase-based
-   setConnectionInfo() path this file doesn't even keep). Package/class name is
-   UNCHANGED (com.freerdp.freerdpcore.services.LibFreeRDP) because the native
-   library's JNI_OnLoad registers its native methods against this exact class via
-   RegisterNatives() — renaming or moving this class would break that binding
-   (confirmed by inspecting the compiled classes.dex of a real freeaRDP release
-   APK, which reports this exact package/class, not a guess).
+   independent of bVNC's GPL-3.0 codebase. Package/class name is UNCHANGED
+   (com.freerdp.freerdpcore.services.LibFreeRDP) because the native library
+   resolves its native methods against this exact class/package via standard JNI
+   symbol-name matching (Java_com_freerdp_freerdpcore_services_LibFreeRDP_...) —
+   renaming or moving this class would break that binding.
 
    Changes from upstream:
    - Removed the BookmarkBase-based setConnectionInfo() overload and its BookmarkBase/
@@ -46,10 +41,38 @@
      per-instance UIEventListener map this plugin owns directly
      (setUIEventListener/removeUIEventListener below) — same information, no extra
      vendored classes.
+   - freerdp_get_build_date() removed: no longer exported by the 3.31.1 native
+     library (confirmed via `nm`/symbol search against the freshly built
+     libfreerdp-android.so) — keeping the declaration would risk an
+     UnsatisfiedLinkError the first time anything called it.
+   - OnVerifyCertificate/OnVerifyChangedCertificate replaced by upstream's own
+     3.x OnVerifyCertificateEx/OnVerifyChangedCertificateEx (host/port/flags
+     replace the old bare hostMismatch boolean — see VERIFY_CERT_FLAG_* in
+     freerdp/freerdp.h; VERIFY_CERT_FLAG_MISMATCH is the old boolean's successor).
+   - OnPointerSet/OnPointerSetNull/OnPointerSetDefault are NEW (upstream 3.x,
+     PR #12786) — the actual cursor-shape feature this rebuild exists for.
+   - The static initializer now ALSO explicitly System.loadLibrary()s
+     "freerdp-client3"/"freerdp3"/"winpr3" after "freerdp-android" — copied
+     verbatim (down to the comment) from upstream 3.31.1's own static
+     initializer, which does this specifically "to trigger JNI_OnLoad calls".
+     Android's dynamic linker resolves freerdp-android.so's transitive
+     DT_NEEDED deps on its own, but the JVM only invokes JNI_OnLoad for a
+     library named directly in System.loadLibrary() — never for one pulled in
+     transitively. winpr3.so's own JNI_OnLoad (winpr/libwinpr/utils/android.c)
+     is what populates its module-global JavaVM* used by the Android-specific
+     JNI-based Unicode conversion path (winpr/libwinpr/crt/unicode_android.c);
+     without it that pointer stays NULL and the first UTF8->WChar conversion
+     during freerdp_settings_new() segfaults on a null-pointer JNI call
+     (WINPR_ASSERT is a no-op in a Release build, so nothing catches it
+     earlier) — confirmed by symbolicating a real device tombstone with
+     llvm-addr2line against these exact unstripped .so files: the crash
+     chain was freerdp_settings_new -> helpers.c's init_app_details ->
+     MultiByteToWideChar -> winpr_jni_attach_thread's `(*jniVm)->GetEnv(...)`
+     on a null jniVm. This is a real difference from FreeRDP 2.11.7, which
+     had no such Android-specific JNI Unicode path and never needed this.
    Every native method declaration and both listener interfaces (including the
-   exact method names/signatures native code calls back into, like the misspelled
-   "OnVerifiyCertificate") are UNCHANGED from upstream 2.11.7, since those must
-   match exactly what the native library expects/provides.
+   exact method names/signatures native code calls back into) must match exactly
+   what the native library expects/provides.
 */
 
 package com.freerdp.freerdpcore.services;
@@ -80,7 +103,16 @@ public class LibFreeRDP
 		try
 		{
 			System.loadLibrary("freerdp-android");
+
+			/* Load dependent libraries too to trigger JNI_OnLoad calls — see class doc. */
 			String version = freerdp_get_jni_version();
+			String[] versions = version.split("[\\.-]");
+			if (versions.length > 0)
+			{
+				System.loadLibrary("freerdp-client" + versions[0]);
+				System.loadLibrary("freerdp" + versions[0]);
+				System.loadLibrary("winpr" + versions[0]);
+			}
 			Pattern pattern = Pattern.compile("^(\\d+)\\.(\\d+)\\.(\\d+).*");
 			Matcher matcher = pattern.matcher(version);
 			if (!matcher.matches() || (matcher.groupCount() < 3))
@@ -120,8 +152,6 @@ public class LibFreeRDP
 
 	private static native String freerdp_get_version();
 
-	private static native String freerdp_get_build_date();
-
 	private static native String freerdp_get_build_revision();
 
 	private static native String freerdp_get_build_config();
@@ -145,6 +175,8 @@ public class LibFreeRDP
 
 	private static native boolean freerdp_send_unicodekey_event(long inst, int keycode,
 	                                                            boolean down);
+
+	private static native boolean freerdp_is_unicode_input_supported(long inst);
 
 	private static native boolean freerdp_send_clipboard_data(long inst, String data);
 
@@ -350,6 +382,31 @@ public class LibFreeRDP
 		return freerdp_send_unicodekey_event(inst, keycode, down);
 	}
 
+	/**
+	 * True if the connected server accepted Unicode keyboard input during capability negotiation.
+	 * MUST be checked before ever calling sendUnicodeKeyEvent(): the vendored native
+	 * android_event.c (android_process_event's EVENT_TYPE_KEY_UNICODE case) treats
+	 * freerdp_input_send_unicode_keyboard_event()'s normal, documented FALSE return for an
+	 * unsupported server as a fatal I/O failure and tears down the ENTIRE connection — confirmed by
+	 * symbolicating a real device tombstone (chain: freerdp_input_send_unicode_keyboard_event
+	 * returns FALSE -> android_process_event returns FALSE -> android_check_handle returns FALSE ->
+	 * android_freerdp_run's main loop logs "Failed to check android file descriptor" and breaks).
+	 * A genuine upstream bug (not ours to fix without patching/rebuilding the native library), so
+	 * RdpClient avoids it entirely by using this check to route printable characters through the
+	 * Virtual-Key path instead whenever it returns false. See RdpClient's [unicodeSupported] doc.
+	 */
+	public static boolean isUnicodeInputSupported(long inst)
+	{
+		try
+		{
+			return freerdp_is_unicode_input_supported(inst);
+		}
+		catch (Exception e)
+		{
+			return true; // optimistic default — matches every server that DOES support it
+		}
+	}
+
 	public static boolean sendClipboardData(long inst, String data)
 	{
 		return freerdp_send_clipboard_data(inst, data);
@@ -425,26 +482,56 @@ public class LibFreeRDP
 		return false;
 	}
 
-	private static int OnVerifyCertificate(long inst, String commonName, String subject,
-	                                       String issuer, String fingerprint, boolean hostMismatch)
+	private static int OnVerifyCertificateEx(long inst, String host, long port, String commonName,
+	                                         String subject, String issuer, String fingerprint,
+	                                         long flags)
 	{
 		UIEventListener uiEventListener = uiListenerFor(inst);
 		if (uiEventListener != null)
-			return uiEventListener.OnVerifiyCertificate(commonName, subject, issuer, fingerprint,
-			                                            hostMismatch);
+			return uiEventListener.OnVerifyCertificateEx(host, port, commonName, subject, issuer,
+			                                             fingerprint, flags);
 		return 0;
 	}
 
-	private static int OnVerifyChangedCertificate(long inst, String commonName, String subject,
-	                                              String issuer, String fingerprint,
-	                                              String oldSubject, String oldIssuer,
-	                                              String oldFingerprint)
+	private static int OnVerifyChangedCertificateEx(long inst, String host, long port,
+	                                                String commonName, String subject,
+	                                                String issuer, String fingerprint,
+	                                                String oldSubject, String oldIssuer,
+	                                                String oldFingerprint, long flags)
 	{
 		UIEventListener uiEventListener = uiListenerFor(inst);
 		if (uiEventListener != null)
-			return uiEventListener.OnVerifyChangedCertificate(
-			    commonName, subject, issuer, fingerprint, oldSubject, oldIssuer, oldFingerprint);
+			return uiEventListener.OnVerifyChangedCertificateEx(
+			    host, port, commonName, subject, issuer, fingerprint, oldSubject, oldIssuer,
+			    oldFingerprint, flags);
 		return 0;
+	}
+
+	/** NEW in FreeRDP 3.x (upstream PR #12786) — the actual cursor-shape callbacks. [pixels] is a
+	 *  premultiplied ARGB pixel buffer of size width*height (row-major), [xPos]/[yPos] the cursor's
+	 *  hotspot within that bitmap. Fires whenever the remote sets a custom cursor shape. */
+	private static void OnPointerSet(long inst, int[] pixels, int width, int height, int xPos,
+	                                 int yPos)
+	{
+		UIEventListener uiEventListener = uiListenerFor(inst);
+		if (uiEventListener != null)
+			uiEventListener.OnPointerSet(pixels, width, height, xPos, yPos);
+	}
+
+	/** Remote hid the cursor entirely (e.g. app hover-hides it). */
+	private static void OnPointerSetNull(long inst)
+	{
+		UIEventListener uiEventListener = uiListenerFor(inst);
+		if (uiEventListener != null)
+			uiEventListener.OnPointerSetNull();
+	}
+
+	/** Remote wants the platform's default arrow cursor back. */
+	private static void OnPointerSetDefault(long inst)
+	{
+		UIEventListener uiEventListener = uiListenerFor(inst);
+		if (uiEventListener != null)
+			uiEventListener.OnPointerSetDefault();
 	}
 
 	private static void OnGraphicsUpdate(long inst, int x, int y, int width, int height)
@@ -494,17 +581,24 @@ public class LibFreeRDP
 		boolean OnGatewayAuthenticate(StringBuilder username, StringBuilder domain,
 		                              StringBuilder password);
 
-		int OnVerifiyCertificate(String commonName, String subject, String issuer,
-		                         String fingerprint, boolean mismatch);
+		int OnVerifyCertificateEx(String host, long port, String commonName, String subject,
+		                         String issuer, String fingerprint, long flags);
 
-		int OnVerifyChangedCertificate(String commonName, String subject, String issuer,
-		                               String fingerprint, String oldSubject, String oldIssuer,
-		                               String oldFingerprint);
+		int OnVerifyChangedCertificateEx(String host, long port, String commonName, String subject,
+		                                 String issuer, String fingerprint, String oldSubject,
+		                                 String oldIssuer, String oldFingerprint, long flags);
 
 		void OnGraphicsUpdate(int x, int y, int width, int height);
 
 		void OnGraphicsResize(int width, int height, int bpp);
 
 		void OnRemoteClipboardChanged(String data);
+
+		/** See LibFreeRDP.OnPointerSet's doc — real cursor-shape support (FreeRDP 3.x only). */
+		void OnPointerSet(int[] pixels, int width, int height, int xPos, int yPos);
+
+		void OnPointerSetNull();
+
+		void OnPointerSetDefault();
 	}
 }

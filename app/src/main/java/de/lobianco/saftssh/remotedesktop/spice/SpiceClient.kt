@@ -160,10 +160,20 @@ class SpiceClient(
         blitFailing = false
         surfaceRefreshThread?.interrupt()
         surfaceRefreshThread = Thread {
-            for (delayMs in longArrayOf(0, 60, 150, 300, 550)) {
+            for (delayMs in longArrayOf(0, 60, 150, 300, 550, 900, 1500)) {
                 try { Thread.sleep(delayMs) } catch (_: InterruptedException) { return@Thread }
-                if (targetSurface !== surface) return@Thread
-                blitToSurface()
+                // Clear the backoff before EVERY attempt, not once before the loop. The first
+                // failure re-arms it (blitToSurface sets blitFailing on a failed lockCanvas), and
+                // that method's own guard then swallows every remaining retry in this ladder —
+                // they all fall well inside BLIT_RETRY_INTERVAL_MS. So the settle-window retry this
+                // thread exists for was, in practice, a SINGLE attempt: if that one landed while
+                // the buffer was still reallocating, a STATIC remote screen had nothing left to
+                // re-trigger a draw and stayed black indefinitely. Reported after opening another
+                // protocol's tab and switching back — starting that other session keeps the device
+                // busy for about as long as this ladder used to run, which is why it showed up there.
+                blitFailing = false
+                blitToSurface(force = true)
+                if (!blitFailing) return@Thread   // one landed — nothing left to retry
             }
         }.apply { isDaemon = true; start() }
     }
@@ -393,12 +403,15 @@ class SpiceClient(
     }
 
     /** See VncClient.blitToSurface's doc for the display-off backoff reasoning — identical here. */
-    private fun blitToSurface() {
+    /** [force] bypasses the display-off backoff below — only updateSurface's bounded
+     *  settle-window ladder uses it; see there for why the backoff would otherwise
+     *  suppress its own retries. */
+    private fun blitToSurface(force: Boolean = false) {
         val bmp = bitmap ?: return
         val surface = targetSurface ?: return
         if (!surface.isValid) return
         val now = System.currentTimeMillis()
-        if (blitFailing && now - lastBlitAttemptMs < BLIT_RETRY_INTERVAL_MS) return
+        if (!force && blitFailing && now - lastBlitAttemptMs < BLIT_RETRY_INTERVAL_MS) return
         lastBlitAttemptMs = now
         synchronized(renderLock) {
             try {
@@ -424,7 +437,7 @@ class SpiceClient(
                 blitFailing = false
             } catch (e: Exception) {
                 blitFailing = true
-                AppLog.w(TAG, "blitToSurface failed: ${e.message}")
+                AppLog.w(TAG, "blitToSurface failed: ${e.javaClass.simpleName}: ${e.message}", e)
             }
         }
     }

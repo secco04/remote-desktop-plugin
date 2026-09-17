@@ -238,6 +238,7 @@ class RemoteDesktopSessionService : Service() {
                     networkPreset = networkPreset,
                     soundEnabled = soundEnabled,
                     udpEnabled = udpEnabled,
+                    keyboardLayout = keyboardLayout,
                     onProgress = { line -> runCatching { callback?.onProgress(line) } },
                     onRemoteSize = { w, h -> runCatching { callback?.onRemoteSize(w, h) } },
                     onConnected = { w, h ->
@@ -368,6 +369,14 @@ class RemoteDesktopSessionService : Service() {
                 spiceClient?.setZoom(scale, panX, panY)
             } catch (e: Exception) {
                 AppLog.w(TAG, "setZoom handling failed", e)
+            }
+        }
+
+        override fun setCursorScale(scale: Float) {
+            try {
+                rdpClient?.setCursorScale(scale) // RDP only — see AIDL doc
+            } catch (e: Exception) {
+                AppLog.w(TAG, "setCursorScale handling failed", e)
             }
         }
 

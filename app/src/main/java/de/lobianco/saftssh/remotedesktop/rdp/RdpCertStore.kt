@@ -16,7 +16,7 @@ class RdpCertStore(context: Context) {
 
     /** True if [fingerprint] is the one already trusted for [host]:[port]. False for both
      *  "never seen this host" and "fingerprint changed" — the caller can't distinguish those
-     *  from this alone, matching how OnVerifiyCertificate / OnVerifyChangedCertificate are two
+     *  from this alone, matching how OnVerifyCertificateEx / OnVerifyChangedCertificateEx are two
      *  different native callbacks anyway. */
     fun isTrusted(host: String, port: Int, fingerprint: String): Boolean =
         prefs.getString(key(host, port), null) == fingerprint
