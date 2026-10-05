@@ -18,14 +18,16 @@ import android.widget.Toast
  *  entirely as a bound service, same pattern as the Linux Plugin's InfoActivity. */
 class InfoActivity : Activity() {
 
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        PluginPermissionRequest.onResult(this, requestCode, permissions, grantResults)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        if (Build.VERSION.SDK_INT >= 33 &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
-        }
+        // Notifications + (Android 17+) local-network access — see PluginPermissionRequest.
+        if (PluginPermissionRequest.onCreate(this)) return
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
