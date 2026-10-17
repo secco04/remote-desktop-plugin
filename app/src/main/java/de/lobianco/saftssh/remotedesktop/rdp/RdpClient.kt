@@ -173,6 +173,39 @@ class RdpClient(
     @Volatile private var blitFailing = false
     @Volatile private var lastBlitAttemptMs = 0L
 
+    // ── Render thread ──
+    // Every trigger (FreeRDP's OnGraphicsUpdate — often MANY small rectangles per frame —, pointer
+    // moves, zoom/pan) used to redraw the whole Surface right where it happened: on FreeRDP's
+    // thread or on a Binder thread. Zoomed in, each of those redraws scales the framebuffer onto
+    // the full Surface, so updates and pointer moves queued up behind each other — reported as a
+    // very laggy mouse pointer while zoomed. Now they only flag a redraw; this one thread draws at
+    // most once per frame for any number of triggers since the last one.
+    @Volatile private var renderRequested = false
+    @Volatile private var renderRunning = true
+    private val renderThread = Thread({
+        while (renderRunning) {
+            if (!renderRequested) { java.util.concurrent.locks.LockSupport.parkNanos(50_000_000L); continue }
+            renderRequested = false
+            val start = System.nanoTime()
+            blitToSurface()
+            // Frame pacing: at most ~60 redraws a second, later triggers coalesce into the next.
+            val left = 16_000_000L - (System.nanoTime() - start)
+            if (left > 0) java.util.concurrent.locks.LockSupport.parkNanos(left)
+        }
+    }, "RDP-render").apply { isDaemon = true; start() }
+
+    private fun requestRender() {
+        renderRequested = true
+        java.util.concurrent.locks.LockSupport.unpark(renderThread)
+    }
+
+    // How the CURRENT Surface object is drawn: 0 = undecided, 1 = GPU (lockHardwareCanvas),
+    // 2 = CPU. One Surface object can only ever be connected with one of the two — reset per
+    // Surface by updateSurface. GPU first: scaling the framebuffer onto a full phone screen in
+    // software is what made zoomed RDP sluggish. Guarded by renderLock.
+    private var canvasMode = 0
+    private val gpuBitmapPaint = android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG)
+
     fun setZoom(scale: Float, newPanX: Float, newPanY: Float) {
         zoomScale = scale.coerceAtLeast(0.1f)
         panX = newPanX
@@ -184,11 +217,10 @@ class RdpClient(
         // OnGraphicsUpdate-driven ones for renderLock. Reported as "randscrollen laggt noch sehr"
         // even after the timer itself was smoothed out — the remaining lag was this, not the pan
         // math, and RDP's typically-heavier update traffic is exactly why it showed up here first.
-        val now = System.currentTimeMillis()
-        if (now - lastSupplementalBlitMs >= 16L) {
-            lastSupplementalBlitMs = now
-            blitToSurface()
-        }
+        // The user is interacting, so the display is on: any blit failure now is transient (a
+        // resize), never the display-off case the backoff exists for — don't let it stall.
+        blitFailing = false
+        requestRender()
     }
 
     /** RDP-only user-adjustable cursor size — see IRemoteDesktopSession.setCursorScale's AIDL doc.
@@ -196,7 +228,7 @@ class RdpClient(
      *  invisible cursor. */
     fun setCursorScale(scale: Float) {
         cursorScale = scale.coerceIn(0.5f, 4f)
-        blitToSurface()
+        requestRender()
     }
 
     /** Swaps in a fresh Surface mid-session, with retried re-blits across the resize settle window
@@ -204,7 +236,15 @@ class RdpClient(
      *  reallocating buffer during an IME/rotation resize and, on a static remote screen, leave the
      *  view frozen with nothing to re-trigger a draw). */
     fun updateSurface(surface: Surface) {
-        targetSurface = surface
+        // A new Surface object arrives per resize step (IME/rotation). The old one stays connected
+        // to the BufferQueue until released, and locking the new one then fails ("already
+        // connected"). Release it under renderLock so no blit is using it right now.
+        synchronized(renderLock) {
+            val old = targetSurface
+            targetSurface = surface
+            canvasMode = 0
+            if (old != null && old !== surface) runCatching { old.release() }
+        }
         // See VncClient.updateSurface's identical reset — a fresh Surface shouldn't inherit the
         // old one's display-off backoff.
         blitFailing = false
@@ -317,7 +357,7 @@ class RdpClient(
                 // pixels; without it the bitmap never receives any content), then draw.
                 val bmp = bitmap ?: return
                 LibFreeRDP.updateGraphics(inst, bmp, x, y, width, height)
-                blitToSurface()
+                requestRender()
             }
 
             override fun OnGraphicsResize(width: Int, height: Int, bpp: Int) {
@@ -465,6 +505,8 @@ class RdpClient(
         // menu) can have a brand-new session's client already targeting the same reused Surface
         // before this old session's teardown has fully unwound.
         targetSurface = null
+        renderRunning = false
+        java.util.concurrent.locks.LockSupport.unpark(renderThread)
         surfaceRefreshThread?.interrupt()
         runCatching { LibFreeRDP.disconnect(inst) }
         runCatching { LibFreeRDP.removeUIEventListener(inst) }
@@ -504,13 +546,11 @@ class RdpClient(
         runCatching { LibFreeRDP.sendCursorEvent(inst, mx, my, flags) }
             .onSuccess { ok -> if (buttonMask != 0 || currentFlag != 0) AppLog.i(TAG, "sendCursorEvent($mx,$my,flags=0x${flags.toString(16)}) inst=$inst connected=$connected -> $ok") }
             .onFailure { e -> AppLog.w(TAG, "sendCursorEvent threw", e) }
-        // Redraw so the synthetic cursor tracks the pointer between server frames. Throttled (see
-        // lastSupplementalBlitMs's doc) so a fast drag can't starve real protocol-driven redraws.
-        val now = System.currentTimeMillis()
-        if (now - lastSupplementalBlitMs >= 16L) {
-            lastSupplementalBlitMs = now
-            blitToSurface()
-        }
+        // Redraw so the cursor tracks the pointer between server frames — on the render thread,
+        // coalesced with everything else (see renderThread). Input means the display is on, so a
+        // running display-off backoff is lifted.
+        blitFailing = false
+        requestRender()
     }
 
     // Which of Ctrl/Alt/Win are currently held (tracked from the key events themselves). When one
@@ -574,8 +614,29 @@ class RdpClient(
         if (!force && blitFailing && now - lastBlitAttemptMs < BLIT_RETRY_INTERVAL_MS) return
         lastBlitAttemptMs = now
         synchronized(renderLock) {
+            if (surface !== targetSurface) return   // replaced (and released) meanwhile
             try {
-                val canvas = surface.lockCanvas(null) ?: run { blitFailing = true; return }
+                val canvas = if (canvasMode == 2) {
+                    surface.lockCanvas(null) ?: run { blitFailing = true; return }
+                } else {
+                    try {
+                        surface.lockHardwareCanvas().also {
+                            if (canvasMode == 0) AppLog.i(TAG, "blitToSurface: drawing on the GPU")
+                            canvasMode = 1
+                        }
+                    } catch (e: Exception) {
+                        // Only the first attempt on a Surface decides; later failures are transient.
+                        if (canvasMode != 0) throw e
+                        try {
+                            (surface.lockCanvas(null) ?: run { blitFailing = true; return }).also {
+                                canvasMode = 2
+                                AppLog.w(TAG, "blitToSurface: GPU canvas unavailable (${e.message}) — drawing on the CPU")
+                            }
+                        } catch (cpu: Exception) {
+                            throw cpu   // not ready yet — decide again next time (canvasMode stays 0)
+                        }
+                    }
+                }
                 try {
                     // Letterbox * zoom — see VncClient.blitToSurface for the identical reasoning.
                     val sw = canvas.width
@@ -591,7 +652,7 @@ class RdpClient(
                     renderOffsetX = ox
                     renderOffsetY = oy
                     canvas.drawColor(Color.BLACK)
-                    canvas.drawBitmap(bmp, null, RectF(ox, oy, ox + dw, oy + dh), null)
+                    canvas.drawBitmap(bmp, null, RectF(ox, oy, ox + dw, oy + dh), if (canvasMode == 1) gpuBitmapPaint else null)
                     // Real remote cursor shape when we have one (FreeRDP 3.x) — same render
                     // pipeline as the framebuffer itself, so it stays in sync with pan/zoom.
                     // Falls back to the synthetic cursor when no real shape has arrived yet or
