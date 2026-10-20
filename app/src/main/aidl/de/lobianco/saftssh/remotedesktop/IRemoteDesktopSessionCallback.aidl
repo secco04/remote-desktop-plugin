@@ -25,4 +25,8 @@ oneway interface IRemoteDesktopSessionCallback {
      *  never sends it (the app keeps its previous, looser bound), and a new plugin paired with an
      *  old app has the oneway call silently dropped by the old stub. */
     void onRemoteSize(int width, int height);
+
+    /** Text the user copied on the remote side (RDP cliprdr). The main app puts it on the
+     *  phone's clipboard. Appended last for the same compatibility reason as onRemoteSize. */
+    void onRemoteClipboardText(String text);
 }

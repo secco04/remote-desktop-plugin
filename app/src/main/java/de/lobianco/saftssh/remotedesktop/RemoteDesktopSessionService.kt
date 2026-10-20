@@ -242,6 +242,7 @@ class RemoteDesktopSessionService : Service() {
                     keyboardLayout = keyboardLayout,
                     onProgress = { line -> runCatching { callback?.onProgress(line) } },
                     onRemoteSize = { w, h -> runCatching { callback?.onRemoteSize(w, h) } },
+                    onRemoteClipboard = { text -> runCatching { callback?.onRemoteClipboardText(text) } },
                     onConnected = { w, h ->
                         runCatching { callback?.onConnected() }
                         AppLog.i(TAG, "RDP connected: ${w}x$h")
@@ -402,6 +403,15 @@ class RemoteDesktopSessionService : Service() {
                 spiceClient?.sendKeyEvent(keyCode, unicodeChar, down)
             } catch (e: Exception) {
                 AppLog.w(TAG, "sendKeyEvent handling failed", e)
+            }
+        }
+
+        override fun setClipboardText(text: String?) {
+            if (text.isNullOrEmpty()) return
+            try {
+                rdpClient?.setClipboardText(text) // RDP only — see AIDL doc
+            } catch (e: Exception) {
+                AppLog.w(TAG, "setClipboardText handling failed", e)
             }
         }
 

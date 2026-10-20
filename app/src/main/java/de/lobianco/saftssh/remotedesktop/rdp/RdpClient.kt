@@ -108,6 +108,9 @@ class RdpClient(
      *  main app bounds its pinch-zoom panning to the real picture extent, see
      *  IRemoteDesktopSessionCallback.onRemoteSize. Defaulted so nothing else has to supply it. */
     private val onRemoteSize: (width: Int, height: Int) -> Unit = { _, _ -> },
+    /** Text copied on the remote side (cliprdr) — the main app puts it on the phone's clipboard,
+     *  see IRemoteDesktopSessionCallback.onRemoteClipboardText. */
+    private val onRemoteClipboard: (String) -> Unit = {},
 ) {
     private val certStore = RdpCertStore(context)
     private var inst: Long = 0
@@ -296,6 +299,7 @@ class RdpClient(
                 }
                 if (!connected) {
                     connected = true
+                    connectedAtMs = android.os.SystemClock.elapsedRealtime()
                     onProgress("Connected — ${width}x$height")
                     onConnected(width, height)
                 }
@@ -367,7 +371,15 @@ class RdpClient(
                 allocateFramebuffer(width, height)
             }
 
-            override fun OnRemoteClipboardChanged(data: String?) {}
+            override fun OnRemoteClipboardChanged(data: String?) {
+                // Used to be a no-op, so copying on the remote side never reached the phone.
+                // FreeRDP hands over CF_UNICODETEXT with Windows line ends and often a trailing NUL.
+                val text = data?.trimEnd('\u0000')?.replace("\r\n", "\n")
+                if (text.isNullOrEmpty() || text == lastClipboardText) return
+                lastClipboardText = text
+                AppLog.i(TAG, "Remote clipboard changed (${text.length} chars)")
+                onRemoteClipboard(text)
+            }
         })
 
         // Build the connection as a freerdp:// URI — see LibFreeRDP.setConnectionInfo(Uri)'s doc:
@@ -507,6 +519,7 @@ class RdpClient(
         targetSurface = null
         renderRunning = false
         java.util.concurrent.locks.LockSupport.unpark(renderThread)
+        clipboardRetryThread?.interrupt()
         surfaceRefreshThread?.interrupt()
         runCatching { LibFreeRDP.disconnect(inst) }
         runCatching { LibFreeRDP.removeUIEventListener(inst) }
@@ -515,6 +528,63 @@ class RdpClient(
     }
 
     fun isAlive(): Boolean = connected
+
+    // ── Clipboard (cliprdr) ──
+    // Last text exchanged in either direction: the app writing the remote's text to the phone's
+    // clipboard fires its own clipboard listener, which sends the same text straight back here.
+    @Volatile private var lastClipboardText: String? = null
+    @Volatile private var pendingClipboardText: String? = null
+    @Volatile private var clipboardRetryThread: Thread? = null
+    @Volatile private var connectedAtMs = 0L
+
+    /** Offers [text] to the server's clipboard, so a paste there (Ctrl+V) inserts it. FreeRDP only
+     *  accepts it once the cliprdr channel is up (shortly AFTER the connect), so until then the
+     *  text is kept and retried for a few seconds — the app sends the current clipboard right when
+     *  the session opens. */
+    fun setClipboardText(text: String) {
+        if (text.isEmpty() || text == lastClipboardText) return
+        pendingClipboardText = text
+        if (trySendPendingClipboard()) return
+        if (clipboardRetryThread?.isAlive == true) return
+        clipboardRetryThread = Thread({
+            try {
+                repeat(40) {   // ~20 s
+                    Thread.sleep(500)
+                    if (!renderRunning || trySendPendingClipboard()) return@Thread
+                }
+                AppLog.w(TAG, "Clipboard: cliprdr channel never became ready — text not offered to the server")
+            } catch (_: InterruptedException) {}
+        }, "RDP-clipboard").apply { isDaemon = true; start() }
+    }
+
+    private fun String.toWindowsLineEnds() = replace("\r\n", "\n").replace("\n", "\r\n")
+
+    private fun trySendPendingClipboard(): Boolean {
+        val text = pendingClipboardText ?: return true
+        if (inst == 0L || !connected || !renderRunning) return false   // renderRunning: not stopped
+        // The server expects Windows line ends in CF_UNICODETEXT.
+        val ok = runCatching { LibFreeRDP.sendClipboardData(inst, text.toWindowsLineEnds()) }
+            .getOrDefault(false)
+        if (ok) {
+            pendingClipboardText = null
+            lastClipboardText = text
+            AppLog.i(TAG, "Clipboard: offered ${text.length} chars to the server")
+            // sendClipboardData only queues an event; right after the connect the cliprdr channel
+            // may not be initialised yet and that first offer is lost. Offer it once more a little
+            // later — repeating an offer is harmless.
+            if (android.os.SystemClock.elapsedRealtime() - connectedAtMs < 5_000L) {
+                Thread({
+                    try {
+                        Thread.sleep(3_000)
+                        if (renderRunning && connected && lastClipboardText == text) {
+                            runCatching { LibFreeRDP.sendClipboardData(inst, text.toWindowsLineEnds()) }
+                        }
+                    } catch (_: InterruptedException) {}
+                }, "RDP-clipboard-reoffer").apply { isDaemon = true; start() }
+            }
+        }
+        return ok
+    }
 
     /** [buttonMask] follows the VNC convention (bit0=left, bit1=middle, bit2=right) — see
      *  [rdpButtonFlag] for the (non-trivial) mapping onto RDP's own BUTTON1/2/3 numbering. */

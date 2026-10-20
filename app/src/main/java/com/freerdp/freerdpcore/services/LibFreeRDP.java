@@ -555,6 +555,13 @@ public class LibFreeRDP
 			uiEventListener.OnRemoteClipboardChanged(data);
 	}
 
+	// Called by the 3.x native layer (android_cliprdr.c) when the server copies an IMAGE. Missing
+	// from the vendored file: the native GetStaticMethodID lookup then failed with a pending
+	// NoSuchMethodError on the cliprdr thread. Images are not handed to the phone; text is.
+	private static void OnRemoteClipboardImageChanged(long inst, byte[] data)
+	{
+	}
+
 	public static String getVersion()
 	{
 		return freerdp_get_version();

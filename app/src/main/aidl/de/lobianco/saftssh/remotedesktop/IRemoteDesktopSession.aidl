@@ -91,4 +91,14 @@ interface IRemoteDesktopSession {
      * needs to wait for the plugin's cleanup to finish.
      */
     oneway void destroy();
+
+    /**
+     * Hands the phone's clipboard text to the remote side, so a paste THERE (Ctrl+V,
+     * right-click > Paste) inserts it. The main app reads the clipboard (only the foreground
+     * app may, since Android 10) whenever it changes while the session is open and when the
+     * session comes back to the foreground. RDP: offered through the cliprdr channel; VNC/SPICE
+     * ignore it. Appended LAST on purpose (see IRemoteDesktopSessionCallback.onRemoteSize's
+     * doc): an old plugin's stub drops this oneway call silently.
+     */
+    oneway void setClipboardText(String text);
 }
