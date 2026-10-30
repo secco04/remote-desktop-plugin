@@ -29,8 +29,8 @@ android {
         applicationId = "de.lobianco.saftssh.remotedesktop"
         minSdk = 26
         targetSdk = 37
-        versionCode = 30
-        versionName = "0.30"
+        versionCode = 32
+        versionName = "0.32"
     }
 
     buildFeatures {

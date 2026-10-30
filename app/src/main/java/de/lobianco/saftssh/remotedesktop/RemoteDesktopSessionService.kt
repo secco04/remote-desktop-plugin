@@ -200,6 +200,7 @@ class RemoteDesktopSessionService : Service() {
                     fastQuality = fastQuality,
                     onProgress = { line -> runCatching { callback?.onProgress(line) } },
                     onRemoteSize = { w, h -> runCatching { callback?.onRemoteSize(w, h) } },
+                    onRemoteClipboard = { text -> runCatching { callback?.onRemoteClipboardText(text) } },
                     onConnected = { w, h ->
                         runCatching { callback?.onConnected() }
                         AppLog.i(TAG, "VNC connected: ${w}x$h")
@@ -409,7 +410,8 @@ class RemoteDesktopSessionService : Service() {
         override fun setClipboardText(text: String?) {
             if (text.isNullOrEmpty()) return
             try {
-                rdpClient?.setClipboardText(text) // RDP only — see AIDL doc
+                rdpClient?.setClipboardText(text)
+                vncClient?.setClipboardText(text) // SPICE: not supported — see AIDL doc
             } catch (e: Exception) {
                 AppLog.w(TAG, "setClipboardText handling failed", e)
             }

@@ -12,13 +12,19 @@ import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.io.EOFException
 import java.io.IOException
 import java.net.Socket
+import java.nio.ByteBuffer
+import java.nio.charset.CodingErrorAction
 import java.security.spec.KeySpec
 import javax.crypto.Cipher
 import javax.crypto.spec.SecretKeySpec
 
 private const val TAG = "VncClient"
+// Clipboard text larger than this is neither sent nor taken over (a stray multi-MB copy on either
+// side shouldn't be shuffled over the wire, let alone held in memory twice).
+private const val MAX_CUT_TEXT_BYTES = 1 shl 20
 // See blitToSurface's doc — how long to back off between retry attempts once lockCanvas() starts
 // failing (e.g. display asleep), instead of retrying on every single incoming server frame.
 private const val BLIT_RETRY_INTERVAL_MS = 2000L
@@ -64,9 +70,10 @@ private const val ENCODING_DESKTOP_SIZE = -223 // §7.7.1: framebuffer resolutio
  * appear. [SyntheticCursor]'s arrow is the fallback until the server first sends a shape, and is
  * essential for the trackpad-style input mode (where the tap position isn't the finger position).
  * (RDP can't do this — FreeRDP 2.11.7's prebuilt Android native lib discards all cursor-shape
- * updates in no-op Pointer callbacks, so it's synthetic-only there.) Does NOT support:
- * Tight/Hextile/ZRLE encodings (servers that refuse to offer Raw will fail — most do offer it),
- * clipboard sync.
+ * updates in no-op Pointer callbacks, so it's synthetic-only there.) Clipboard: plain RFB
+ * Server/ClientCutText (Latin-1), see [setClipboardText]. Does NOT support: Tight/Hextile/ZRLE
+ * encodings (servers that refuse to offer Raw will fail — most do offer it), the Extended
+ * Clipboard pseudo-encoding (UTF-8).
  */
 class VncClient(
     private val host: String,
@@ -84,6 +91,9 @@ class VncClient(
      *  main app bounds its pinch-zoom panning to the real picture extent, see
      *  IRemoteDesktopSessionCallback.onRemoteSize. Defaulted so nothing else has to supply it. */
     private val onRemoteSize: (width: Int, height: Int) -> Unit = { _, _ -> },
+    /** Text copied on the remote side (ServerCutText) — the main app puts it on the phone's
+     *  clipboard, see IRemoteDesktopSessionCallback.onRemoteClipboardText. */
+    private val onRemoteClipboard: (String) -> Unit = {},
     /** Proxmox VE only — when set, connects via [ProxmoxVncWebSocket] to this full
      *  "https://host:port/api2/json/nodes/{node}/qemu/{vmid}/vncwebsocket?port=...&vncticket=..."
      *  URL instead of a raw [Socket] to [host]:[port] — see that class's doc for why Proxmox's VNC
@@ -355,6 +365,55 @@ class VncClient(
         }
     }
 
+    // The text last put on the server's clipboard, as the server will see it — see ServerCutText.
+    @Volatile private var lastSentCutText: String? = null
+
+    /** ClientCutText: the phone's clipboard onto the server's, so a paste there inserts it. RFB
+     *  defines the text as Latin-1 with LF line ends, so characters outside Latin-1 arrive as
+     *  '?' (the Extended Clipboard pseudo-encoding that carries UTF-8 isn't implemented). */
+    fun setClipboardText(text: String) {
+        val out = output ?: return
+        val bytes = text.replace("\r\n", "\n").toByteArray(Charsets.ISO_8859_1)
+        if (bytes.isEmpty() || bytes.size > MAX_CUT_TEXT_BYTES) return
+        lastSentCutText = String(bytes, Charsets.ISO_8859_1)
+        try {
+            synchronized(out) {
+                out.writeByte(6)
+                out.write(byteArrayOf(0, 0, 0)) // padding
+                out.writeInt(bytes.size)
+                out.write(bytes)
+                out.flush()
+            }
+        } catch (e: IOException) {
+            AppLog.w(TAG, "setClipboardText failed: ${e.message}")
+        }
+    }
+
+    /** ServerCutText is Latin-1 by the spec, but some servers send UTF-8 anyway. Bytes that
+     *  decode as valid UTF-8 are taken as such — Latin-1 text with umlauts practically never is
+     *  valid UTF-8 — everything else as Latin-1. */
+    private fun decodeCutText(bytes: ByteArray): String {
+        if (bytes.any { it < 0 }) {
+            val utf8 = Charsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+            runCatching { return utf8.decode(ByteBuffer.wrap(bytes)).toString() }
+        }
+        return String(bytes, Charsets.ISO_8859_1)
+    }
+
+    /** DataInputStream.skipBytes may skip fewer bytes than asked (only what is buffered) — fine
+     *  for a few padding bytes, a stream desync for a payload. */
+    private fun skipFully(inp: DataInputStream, count: Long) {
+        var left = count
+        val buf = ByteArray(16 * 1024)
+        while (left > 0) {
+            val n = inp.read(buf, 0, minOf(left, buf.size.toLong()).toInt())
+            if (n < 0) throw EOFException("stream ended while skipping $left bytes")
+            left -= n
+        }
+    }
+
     // ── Protocol ───────────────────────────────────────────────────────────
 
     private fun runProtocol() {
@@ -419,10 +478,18 @@ class VncClient(
                         inp.skipBytes(numColours * 6)
                     }
                     2 -> { /* Bell — no-op */ }
-                    3 -> { // ServerCutText
+                    3 -> { // ServerCutText — something was copied on the remote side
                         inp.skipBytes(3)
                         val len = inp.readInt()
-                        inp.skipBytes(len)
+                        // Negative = Extended Clipboard format, which we never advertise; skip it.
+                        if (len in 1..MAX_CUT_TEXT_BYTES) {
+                            val text = decodeCutText(ByteArray(len).also { inp.readFully(it) })
+                            // Many servers echo our own ClientCutText back — no need to hand
+                            // the phone the text it just sent.
+                            if (text != lastSentCutText) onRemoteClipboard(text)
+                        } else {
+                            skipFully(inp, if (len < 0) -len.toLong() else len.toLong())
+                        }
                     }
                     else -> throw IOException("Unknown server message type $messageType — protocol desync")
                 }
