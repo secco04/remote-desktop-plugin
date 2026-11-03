@@ -50,9 +50,10 @@ private fun spiceButton(vncButtonMask: Int): Int = when {
  * attribution and why (building spice-gtk + GStreamer from source needs the same infeasible
  * multi-hour Cerbero cross-compile toolchain RDP's doc already explains).
  *
- * No TLS support yet: [SpiceCommunicator.SpiceClientConnect] is always called with an empty TLS
- * port and null certificate params, i.e. a plain SPICE connection — the common case for
- * self-hosted setups (e.g. Proxmox VE's spiceproxy, which is usually unencrypted on the LAN/VPN).
+ * TLS only on the Proxmox path: a direct connection ([SpiceClientConnect], see below) always uses an
+ * empty TLS port and null certificate params, i.e. plain unencrypted SPICE (password and session in
+ * clear) — only for trusted LAN/VPN. Proxmox VE's spiceproxy is TLS-only and goes through the .vv
+ * path. The mode is fixed by [tlsPort]; there is deliberately no fallback from TLS to plain.
  *
  * Relative mouse mode (SPICE_MOUSE_MODE_SERVER, used by some fullscreen/game guests that grab the
  * pointer) isn't supported — this client always sends absolute coordinates, same as VNC/RDP's
@@ -198,6 +199,7 @@ class SpiceClient(
                     vvFile = f
                     native.StartSessionFromVvFile(f.absolutePath, false)
                 } else {
+                    AppLog.w(TAG, "Plain SPICE to $host:$port — no TLS, password and session are unencrypted")
                     native.SpiceClientConnect(host, port.toString(), "", password.orEmpty(), null, null, null, false)
                 }
             }

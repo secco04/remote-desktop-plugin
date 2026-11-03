@@ -29,8 +29,8 @@ android {
         applicationId = "de.lobianco.saftssh.remotedesktop"
         minSdk = 26
         targetSdk = 37
-        versionCode = 32
-        versionName = "0.32"
+        versionCode = 33
+        versionName = "0.33"
     }
 
     buildFeatures {
@@ -98,10 +98,10 @@ dependencies {
     // spiceproxy) — see vnc/ProxmoxVncWebSocket.kt. OkHttp's WebSocket support is the only new
     // dependency this needs; pure Kotlin/Java, no native code, negligible size next to the SPICE
     // native libs already bundled.
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("com.squareup.okhttp3:okhttp:5.5.1")
 
     // FileProvider (data/logging + Submit Logs' ACTION_SEND share sheet) — this module had no
     // AndroidX dependency at all before that was added, so androidx.core.content.FileProvider
     // was an unresolved reference until this was declared.
-    implementation("androidx.core:core-ktx:1.19.0")
+    implementation("androidx.core:core-ktx:1.19.1")
 }

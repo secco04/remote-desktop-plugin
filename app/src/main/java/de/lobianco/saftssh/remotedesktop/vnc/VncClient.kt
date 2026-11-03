@@ -25,6 +25,11 @@ private const val TAG = "VncClient"
 // Clipboard text larger than this is neither sent nor taken over (a stray multi-MB copy on either
 // side shouldn't be shuffled over the wire, let alone held in memory twice).
 private const val MAX_CUT_TEXT_BYTES = 1 shl 20
+// Sanity caps on server-supplied sizes — a hostile server must only be able to end its own session,
+// not OOM the whole plugin process (OutOfMemoryError isn't an Exception). 8192 covers 8K desktops.
+private const val MAX_FB_DIM = 8192
+private const val MAX_CURSOR_DIM = 512
+private const val MAX_SERVER_STRING_BYTES = 4096
 // See blitToSurface's doc — how long to back off between retry attempts once lockCanvas() starts
 // failing (e.g. display asleep), instead of retrying on every single incoming server frame.
 private const val BLIT_RETRY_INTERVAL_MS = 2000L
@@ -499,6 +504,15 @@ class VncClient(
                 AppLog.w(TAG, "VNC session ended: ${e.message}", e)
                 onDisconnected(e.message ?: e.javaClass.simpleName)
             }
+        } catch (e: OutOfMemoryError) {
+            // Last line of defence behind the size caps — an uncaught Error on this thread would
+            // take down the whole plugin process (every other session with it).
+            framebuffer = null
+            cursorBitmap = null
+            if (running) {
+                AppLog.w(TAG, "VNC session ended: out of memory", e)
+                onDisconnected("Server sent data too large to handle (out of memory)")
+            }
         } finally {
             running = false
             runCatching { socket?.close() }
@@ -517,14 +531,21 @@ class VncClient(
         val numTypes = inp.readUnsignedByte()
         if (numTypes == 0) {
             val len = inp.readInt()
-            val reason = ByteArray(len).also { inp.readFully(it) }
-            throw IOException("Server refused connection: ${String(reason)}")
+            val reason = if (len in 0..MAX_SERVER_STRING_BYTES) String(ByteArray(len).also { inp.readFully(it) }) else "no reason given"
+            throw IOException("Server refused connection: $reason")
         }
         val types = ByteArray(numTypes).also { inp.readFully(it) }
         val hasVncAuth = types.contains(2.toByte())
         val hasNone = types.contains(1.toByte())
         val chosen = when {
-            hasVncAuth && !password.isNullOrEmpty() -> 2
+            !password.isNullOrEmpty() -> when {
+                hasVncAuth -> 2
+                // Downgrade guard: a password is configured, so this server is expected to ask for
+                // it. A MITM offering only "None" would otherwise get us to silently show (and type
+                // into) its own fake desktop — refuse instead.
+                hasNone -> throw IOException("Server offered no authentication although a password is configured — refusing (possible man-in-the-middle). Remove the password from the connection if this server really has none.")
+                else -> throw IOException("No supported security type offered (server offered: ${types.joinToString()})")
+            }
             hasNone -> 1
             hasVncAuth -> 2
             else -> throw IOException("No supported security type offered (server offered: ${types.joinToString()})")
@@ -579,7 +600,9 @@ class VncClient(
         val width = inp.readUnsignedShort()
         val height = inp.readUnsignedShort()
         inp.skipBytes(16) // server PIXEL_FORMAT — overridden below
+        checkFramebufferSize(width, height)
         val nameLen = inp.readInt()
+        if (nameLen !in 0..MAX_SERVER_STRING_BYTES) throw IOException("Server sent an invalid desktop name length ($nameLen)")
         val name = ByteArray(nameLen).also { inp.readFully(it) }
         AppLog.i(TAG, "ServerInit: ${width}x$height name=${String(name)}")
 
@@ -613,6 +636,10 @@ class VncClient(
         out.flush()
 
         return width to height
+    }
+
+    private fun checkFramebufferSize(w: Int, h: Int) {
+        if (w !in 1..MAX_FB_DIM || h !in 1..MAX_FB_DIM) throw IOException("Server sent an unsupported desktop size ${w}x$h")
     }
 
     /** Synchronized on [out] — sendPointerEvent/sendKeyEvent/sendScroll (called from Binder
@@ -700,7 +727,11 @@ class VncClient(
                     // the same way) followed by a 1-bit-per-pixel mask (ceil(w/8) bytes per row,
                     // MSB first, 1 = opaque). Decode into an ARGB bitmap and use it as the cursor
                     // so context-sensitive shapes (I-beam, resize arrows, hand) show up.
-                    if (w > 0 && h > 0) {
+                    if (w > MAX_CURSOR_DIM || h > MAX_CURSOR_DIM) {
+                        // Implausibly large shape — drain it and keep the current cursor rather
+                        // than allocating up to several GB for it.
+                        skipFully(inp, w.toLong() * h * bytesPerPixel() + ((w + 7) / 8).toLong() * h)
+                    } else if (w > 0 && h > 0) {
                         val bpp = bytesPerPixel()
                         val pixelBytes = ByteArray(w * h * bpp).also { inp.readFully(it) }
                         val maskStride = (w + 7) / 8
@@ -727,6 +758,7 @@ class VncClient(
                     // No pixel data — w/h are the new full framebuffer size. Reallocate; the next
                     // blit's letterbox fit picks up the new aspect ratio automatically.
                     AppLog.i(TAG, "DesktopSize changed: ${fbWidth}x$fbHeight -> ${w}x$h")
+                    checkFramebufferSize(w, h)
                     fbWidth = w
                     fbHeight = h
                     pointerFbX = pointerFbX.coerceIn(0, w - 1)

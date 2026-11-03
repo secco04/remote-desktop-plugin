@@ -21,6 +21,10 @@ class RdpCertStore(context: Context) {
     fun isTrusted(host: String, port: Int, fingerprint: String): Boolean =
         prefs.getString(key(host, port), null) == fingerprint
 
+    /** The fingerprint currently trusted for [host]:[port], or null if none — tells "changed"
+     *  (possible interception) apart from "never seen" for the app's warning dialog. */
+    fun trustedFingerprint(host: String, port: Int): String? = prefs.getString(key(host, port), null)
+
     fun trust(host: String, port: Int, fingerprint: String) {
         // commit() (synchronous): the trust decision must be on disk before the caller retries
         // the connection, or a crash between "user confirmed" and "write finished" would silently

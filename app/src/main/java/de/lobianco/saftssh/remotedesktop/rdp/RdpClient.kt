@@ -58,7 +58,8 @@ private fun rdpButtonFlag(vncButtonMask: Int): Int = when {
  * server certificate needs a decision — mirrors the main app's own SSH host-key confirmation flow
  * (HostKeyStore): an unknown/changed certificate is REJECTED (not silently accepted — that was
  * flagged and corrected during development), reported to the caller via [onProgress] using the
- * marker "CERT_UNTRUSTED|host|port|fingerprint", and the caller must call
+ * marker "CERT_UNTRUSTED|host|port|fingerprint" (preceded by "CERT_CHANGED|host|port|previous"
+ * when a different certificate was trusted before), and the caller must call
  * [RemoteDesktopSessionService]'s trustRdpCertificate() + retry the connection before it succeeds.
  */
 class RdpClient(
@@ -502,6 +503,14 @@ class RdpClient(
         val fp = fingerprint ?: return 0
         if (certStore.isTrusted(host, port, fp)) return 1
         AppLog.w(TAG, "Untrusted RDP certificate for $host:$port (fingerprint=$fp) — rejecting, awaiting user confirmation")
+        // CHANGED certificate: announce the previously trusted fingerprint in a separate marker
+        // sent right BEFORE the unchanged CERT_UNTRUSTED one, so the app can show its "certificate
+        // changed" warning. A separate line rather than a 5th field because older apps only
+        // accept exactly 4 fields in CERT_UNTRUSTED; they show this extra line as plain progress
+        // text and still get their usual prompt.
+        certStore.trustedFingerprint(host, port)?.let { previous ->
+            onProgress("CERT_CHANGED|$host|$port|$previous")
+        }
         onProgress("CERT_UNTRUSTED|$host|$port|$fp")
         return 0
     }
